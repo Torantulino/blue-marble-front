@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Blue Marble Front</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow:hidden;width:100vw;height:100vh;}
+#canvas{display:block;width:100%;height:100%;cursor:crosshair;}
+#ui{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;}
+
+/* SCREENS */
+.screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:all;background:rgba(0,0,0,0.82);backdrop-filter:blur(4px);}
+.screen.hidden{display:none;}
+
+/* START SCREEN */
+#startScreen h1{font-size:clamp(2rem,6vw,4rem);font-weight:900;letter-spacing:0.05em;background:linear-gradient(135deg,#4af,#0cf,#4af);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-align:center;margin-bottom:0.3em;}
+#startScreen .sub{font-size:clamp(0.9rem,2vw,1.2rem);color:#8cf;margin-bottom:2.5em;text-align:center;max-width:520px;line-height:1.6;}
+#startScreen .features{display:flex;gap:2em;flex-wrap:wrap;justify-content:center;margin-bottom:2.5em;}
+#startScreen .feat{background:rgba(0,180,255,0.08);border:1px solid rgba(0,180,255,0.25);border-radius:12px;padding:1em 1.4em;text-align:center;font-size:0.88rem;color:#adf;max-width:140px;}
+#startScreen .feat .icon{font-size:1.8em;margin-bottom:0.3em;}
+.btn{padding:0.85em 2.5em;font-size:1.1rem;font-weight:700;border:none;border-radius:30px;cursor:pointer;letter-spacing:0.05em;transition:all 0.18s;pointer-events:all;}
+.btn-primary{background:linear-gradient(135deg,#0af,#07f);color:#fff;box-shadow:0 0 24px rgba(0,170,255,0.4);}
+.btn-primary:hover{transform:scale(1.05);box-shadow:0 0 36px rgba(0,170,255,0.6);}
+.btn-secondary{background:rgba(255,255,255,0.1);color:#cdf;border:1px solid rgba(100,200,255,0.3);margin-top:1em;}
+.btn-secondary:hover{background:rgba(255,255,255,0.18);}
+.diff-select{display:flex;gap:0.7em;margin-bottom:1.8em;}
+.diff-btn{padding:0.5em 1.4em;border-radius:20px;border:1px solid rgba(100,200,255,0.35);background:rgba(0,100,200,0.12);color:#9cf;font-size:0.9rem;cursor:pointer;transition:all 0.15s;pointer-events:all;}
+.diff-btn.active{background:rgba(0,150,255,0.35);border-color:#0af;color:#fff;}
+
+/* HUD */
+#hud{position:absolute;top:0;left:0;right:0;display:flex;align-items:stretch;gap:0;background:rgba(0,10,30,0.75);border-bottom:1px solid rgba(0,180,255,0.2);pointer-events:all;}
+#hud.hidden{display:none;}
+.hud-panel{padding:0.45em 1.1em;border-right:1px solid rgba(0,180,255,0.15);display:flex;flex-direction:column;justify-content:center;}
+.hud-label{font-size:0.68rem;color:#68a;text-transform:uppercase;letter-spacing:0.08em;}
+.hud-val{font-size:1rem;font-weight:700;color:#4df;}
+.hud-bar-wrap{height:5px;background:rgba(255,255,255,0.1);border-radius:3px;margin-top:3px;min-width:80px;}
+.hud-bar{height:100%;border-radius:3px;background:linear-gradient(90deg,#0af,#06f);transition:width 0.4s;}
+#minimap-wrap{margin-left:auto;padding:0.3em 0.5em;display:flex;align-items:center;}
+#minimap{border:1px solid rgba(0,180,255,0.3);border-radius:3px;image-rendering:pixelated;}
+
+/* TOOLTIP */
+#tooltip{position:absolute;background:rgba(0,15,40,0.93);border:1px solid rgba(0,180,255,0.35);border-radius:8px;padding:0.5em 0.9em;font-size:0.82rem;color:#cef;pointer-events:none;display:none;max-width:200px;z-index:100;}
+
+/* BOTTOM BAR */
+#bottomBar{position:absolute;bottom:0;left:0;right:0;display:flex;align-items:center;gap:0.5em;padding:0.5em 1em;background:rgba(0,10,30,0.75);border-top:1px solid rgba(0,180,255,0.2);pointer-events:all;}
+#bottomBar.hidden{display:none;}
+#status{flex:1;font-size:0.82rem;color:#8cf;}
+#speedCtrl{display:flex;align-items:center;gap:0.4em;font-size:0.78rem;color:#68a;}
+.speed-btn{width:28px;height:28px;border-radius:50%;border:1px solid rgba(0,180,255,0.3);background:rgba(0,80,180,0.2);color:#9cf;font-size:0.85rem;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+.speed-btn:hover{background:rgba(0,120,255,0.35);}
+#speedLabel{min-width:32px;text-align:center;color:#adf;}
+
+/* GAME OVER */
+#gameOver{flex-direction:column;gap:1em;}
+#gameOver h2{font-size:clamp(1.8rem,5vw,3rem);font-weight:900;}
+#gameOver .result-detail{color:#9cf;font-size:1rem;text-align:center;line-height:1.7;max-width:420px;}
+#gameOver .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:0.7em 2em;margin:0.5em 0;font-size:0.9rem;}
+#gameOver .stat-item .label{color:#68a;font-size:0.78rem;}
+#gameOver .stat-item .val{color:#4df;font-weight:700;font-size:1.05rem;}
+
+/* Controls hint */
+#controls-hint{position:absolute;bottom:50px;right:12px;font-size:0.72rem;color:rgba(100,180,255,0.5);text-align:right;pointer-events:none;line-height:1.7;}
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <!-- START SCREEN -->
+  <div class="screen" id="startScreen">
+    <h1>🌍 Blue Marble Front</h1>
+    <p class="sub">A real-time strategy game of global conquest.<br>Claim tiles, grow your forces, crush every rival nation.</p>
+    <div class="features">
+      <div class="feat"><div class="icon">🗺️</div>Photorealistic<br>Earth Map</div>
+      <div class="feat"><div class="icon">⚔️</div>Territory<br>Expansion</div>
+      <div class="feat"><div class="icon">🤖</div>AI<br>Nations</div>
+      <div class="feat"><div class="icon">🏆</div>80% Globe<br>to Win</div>
+    </div>
+    <div class="diff-select">
+      <button class="diff-btn" data-d="easy">🟢 Easy</button>
+      <button class="diff-btn active" data-d="normal">🟡 Normal</button>
+      <button class="diff-btn" data-d="hard">🔴 Hard</button>
+    </div>
+    <button class="btn btn-primary" id="startBtn">▶ PLAY NOW</button>
+    <button class="btn btn-secondary" id="howtoBtn">📖 How to Play</button>
+  </div>
+
+  <!-- HOW TO PLAY overlay -->
+  <div class="screen hidden" id="howtoScreen">
+    <div style="max-width:520px;text-align:center;">
+      <h2 style="color:#4af;margin-bottom:1em;font-size:1.6rem;">📖 How to Play</h2>
+      <div style="text-align:left;line-height:2;color:#cdf;font-size:0.95rem;">
+        <b style="color:#4df;">🖱️ Click</b> any unclaimed land tile to spawn your nation there<br>
+        <b style="color:#4df;">🗺️ Pan</b> by dragging the map · <b style="color:#4df;">🔍 Zoom</b> with scroll wheel<br>
+        <b style="color:#4df;">⚔️ Expand</b> automatically — troops grow and push outward<br>
+        <b style="color:#4df;">🏙️ Cities</b> appear as you grow, boosting troop capacity<br>
+        <b style="color:#4df;">🎯 Win</b> by controlling 80% of all land tiles<br>
+        <b style="color:#4df;">💀 Lose</b> if your last tile is captured<br>
+        <b style="color:#4df;">⏩ Speed</b> buttons at the bottom adjust simulation rate
+      </div>
+      <button class="btn btn-primary" style="margin-top:1.5em;" id="backBtn">← Back</button>
+    </div>
+  </div>
+
+  <!-- HUD -->
+  <div id="hud" class="hidden">
+    <div class="hud-panel">
+      <div class="hud-label">Nation</div>
+      <div class="hud-val" id="hudNation" style="color:#4df;">—</div>
+    </div>
+    <div class="hud-panel">
+      <div class="hud-label">Tiles</div>
+      <div class="hud-val" id="hudTiles">0</div>
+      <div class="hud-bar-wrap"><div class="hud-bar" id="hudTilesBar" style="width:0%"></div></div>
+    </div>
+    <div class="hud-panel">
+      <div class="hud-label">Troops</div>
+      <div class="hud-val" id="hudTroops">0</div>
+      <div class="hud-bar-wrap"><div class="hud-bar" id="hudTroopsBar" style="width:0%;background:linear-gradient(90deg,#4f8,#0a4)"></div></div>
+    </div>
+    <div class="hud-panel">
+      <div class="hud-label">Control</div>
+      <div class="hud-val" id="hudPct">0%</div>
+    </div>
+    <div class="hud-panel">
+      <div class="hud-label">Tick</div>
+      <div class="hud-val" id="hudTick">0</div>
+    </div>
+    <div id="minimap-wrap">
+      <canvas id="minimap" width="216" height="108"></canvas>
+    </div>
+  </div>
+
+  <!-- BOTTOM BAR -->
+  <div id="bottomBar" class="hidden">
+    <div id="status">Click a land tile to spawn your nation…</div>
+    <div id="speedCtrl">
+      <span>Speed:</span>
+      <button class="speed-btn" id="slowBtn">½</button>
+      <span id="speedLabel">1×</span>
+      <button class="speed-btn" id="fastBtn">2×</button>
+    </div>
+  </div>
+
+  <!-- CONTROLS HINT -->
+  <div id="controls-hint" style="display:none;">
+    Drag to pan · Scroll to zoom<br>Click land to spawn
+  </div>
+
+  <!-- TOOLTIP -->
+  <div id="tooltip"></div>
+
+  <!-- GAME OVER -->
+  <div class="screen hidden" id="gameOver">
+    <h2 id="goTitle">—</h2>
+    <div class="result-detail" id="goDetail"></div>
+    <div class="stats-grid" id="goStats"></div>
+    <button class="btn btn-primary" id="replayBtn" style="margin-top:1em;">↺ Play Again</button>
+  </div>
+</div>
+
+<script>
+// ============================================================
+//  BLUE MARBLE FRONT  —  M0 Prototype
+//  Single-file HTML · Zero dependencies · Canvas 2D
+// ============================================================
+
+// ── CONFIG ──────────────────────────────────────────────────
+const CFG = {
+  GW: 540, GH: 270,           // Grid dimensions (tiles)
+  PLAYER_COLOR: '#00ccff',
+  WIN_PCT: 0.80,
+  AI_COUNT: 12,
+  TICK_MS: 100,               // base tick interval
+  TROOP_REGEN_BASE: 10,
+  MAX_TROOP_SCALE: 2,
+  EXPAND_INTERVAL: 3,         // ticks between expansions
+  AI_EXPAND_INTERVAL: 3,
+};
+
+// ── WORLD COLORS (per-player palette) ───────────────────────
+const PLAYER_COLORS = [
+  '#00ccff','#ff4444','#44ff88','#ffcc00','#ff44ff',
+  '#ff8800','#00ffee','#aa44ff','#ff6688','#66ff44',
+  '#ffaa44','#44aaff','#ff2299',
+];
+
+// ── TERRAIN MAP (uses a procedural land mask) ────────────────
+// We generate a plausible Earth land mask from a seeded noise function
+// rather than loading an external image (zero dependency requirement).
+
+// Simple seeded PRNG
+function mulberry32(seed){
+  return function(){seed|=0;seed=seed+0x6D2B79F5|0;
+    let t=Math.imul(seed^seed>>>15,1|seed);
+    t=t+Math.imul(t^t>>>7,61|t)^t;
+    return((t^t>>>14)>>>0)/4294967296;}
+}
+
+// ── LAND MASK GENERATION (encoded Earth outline) ─────────────
+// We use an approximated Earth polygon rasterised at runtime.
+// Continents are described as lat/lon bounding boxes + ellipse corrections.
+
+function generateLandMask(W, H) {
+  const mask = new Uint8Array(W * H);
+  const rng = mulberry32(0xBEEF1234);
+
+  // Define continent blobs: [lonMin,lonMax,latMin,latMax, density]
+  const continents = [
+    // North America
+    [-168,-52, 25, 72, 0.82],
+    // Greenland
+    [-73,-12, 60, 84, 0.78],
+    // South America
+    [-81,-34,-56, 13, 0.88],
+    // Europe
+    [-12, 40, 36, 71, 0.80],
+    // Africa
+    [-18, 52,-35, 37, 0.90],
+    // Asia (west)
+    [26, 90, 10, 72, 0.88],
+    // Asia (east)
+    [90,145, 10, 72, 0.85],
+    // Southeast Asia islands
+    [95,141,-10, 20, 0.50],
+    // Australia
+    [114,154,-44, -9, 0.85],
+    // New Zealand
+    [166,178,-47,-34, 0.75],
+    // Japan
+    [130,146, 31, 46, 0.70],
+    // UK/Ireland
+    [-11,  2, 50, 60, 0.72],
+    // Iceland
+    [-25, -9, 63, 66, 0.68],
+    // Antarctica
+    [-180,180,-90,-62, 0.90],
+    // Alaska peninsula
+    [-168,-130, 54, 72, 0.75],
+    // Central America
+    [-92,-77,  7, 18, 0.60],
+    // Caribbean islands
+    [-85,-60, 14, 24, 0.25],
+    // Scandinavia
+    [  4, 31, 55, 71, 0.78],
+    // Indian subcontinent
+    [ 68, 88,  8, 35, 0.90],
+    // Sri Lanka
+    [ 80, 82,  6,  9, 0.65],
+    // Madagascar
+    [ 44, 50,-26,-12, 0.75],
+    // Philippines
+    [118,127,  5, 20, 0.45],
+    // Borneo
+    [108,119,  0, 10, 0.72],
+    // Sumatra
+    [ 95,106, -6,  6, 0.75],
+    // New Guinea
+    [131,151, -8,  0, 0.72],
+  ];
+
+  for(let y=0;y<H;y++){
+    const lat = 90 - (y+0.5)*(180/H);
+    for(let x=0;x<W;x++){
+      const lon = -180 + (x+0.5)*(360/W);
+      let land = false;
+      for(const [lo,hi,la,lb,dens] of continents){
+        if(lon>=lo && lon<=hi && lat>=la && lat<=lb){
+          // Add some noise-based irregularity
+          if(rng() < dens) { land=true; break; }
+        }
+      }
+      mask[y*W+x] = land ? 1 : 0;
+    }
+  }
+
+  // Smooth pass: majority vote 3×3
+  const tmp = new Uint8Array(mask);
+  for(let y=1;y<H-1;y++){
+    for(let x=1;x<W-1;x++){
+      let s=0;
+      for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++) s+=tmp[((y+dy)*W+(x+dx+W)%W)];
+      mask[y*W+x] = s>=5?1:s<=3?0:tmp[y*W+x];
+    }
+  }
+  return mask;
+}
+
+// ── GAME STATE ───────────────────────────────────────────────
+let state = {
+  phase: 'start', // start | play | over
+  tick: 0,
+  speed: 1,
+  difficulty: 'normal',
+  landMask: null,
+  owners: null,    // Int16Array, -1=unclaimed, 0=player, 1..N=AI
+  troops: null,    // Float32Array per-player
+  tiles: null,     // Int32Array per-player (tile count)
+  maxTroops: null, // Float32Array per-player
+  colors: null,
+  names: null,
+  alive: null,     // bool[]
+  playerIdx: 0,
+  totalLand: 0,
+  tickTimer: null,
+  gameStartTick: 0,
+  expandQueue: [],  // per-player frontier queues
+  GW: CFG.GW, GH: CFG.GH,
+};
+
+// ── NATION NAMES ─────────────────────────────────────────────
+const NATION_NAMES = [
+  'Valdoria','Crimson Empire','Verdania','Aurelia','Noctara',
+  'Inferna','Thalassion','Umbral League','Roseveil','Fernwood',
+  'Solareth','Azurion','Magentara','Crystalis','Stormholt',
+];
+
+// ── MAP RENDERING ────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let offscreen = null; // cached terrain layer
+let mmCanvas = document.getElementById('minimap');
+let mmCtx = mmCanvas.getContext('2d');
+
+// Viewport
+let view = { x:0, y:0, scale:2.0, minScale:0.5, maxScale:16 };
+let drag = { active:false, sx:0, sy:0, svx:0, svy:0 };
+
+function resize(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  if(offscreen) renderTerrain();
+}
+window.addEventListener('resize', resize);
+
+// ── BUILD OFFSCREEN TERRAIN CANVAS ───────────────────────────
+function buildOffscreen(){
+  const {GW,GH,landMask} = state;
+  offscreen = document.createElement('canvas');
+  offscreen.width = GW; offscreen.height = GH;
+  const oc = offscreen.getContext('2d');
+  const img = oc.createImageData(GW,GH);
+  const d = img.data;
+  for(let i=0;i<GW*GH;i++){
+    const land = landMask[i];
+    const idx = i*4;
+    if(land){
+      // Earth-toned land
+      const x=i%GW, y=Math.floor(i/GW);
+      const lat = Math.abs(90 - y*(180/GH));
+      // Biome tint
+      if(lat>60){d[idx]=200;d[idx+1]=220;d[idx+2]=230;}       // polar
+      else if(lat>45){d[idx]=100;d[idx+1]=130;d[idx+2]=80;}   // temperate
+      else if(lat>25){d[idx]=120;d[idx+1]=150;d[idx+2]=60;}   // subtropical
+      else{d[idx]=80;d[idx+1]=140;d[idx+2]=40;}               // tropical
+      d[idx+3]=255;
+    } else {
+      // Ocean gradient
+      const y2=i/GW/GH;
+      const b = Math.floor(30+50*y2);
+      d[idx]=5;d[idx+1]=20+Math.floor(30*y2);d[idx+2]=b+60;d[idx+3]=255;
+    }
+  }
+  oc.putImageData(img,0,0);
+}
+
+// ── OVERLAY CANVAS (ownership) ───────────────────────────────
+let overlay = null;
+function buildOverlay(){
+  const {GW,GH} = state;
+  overlay = document.createElement('canvas');
+  overlay.width = GW; overlay.height = GH;
+}
+
+function updateOverlay(){
+  const {GW,GH,owners,colors,alive} = state;
+  if(!overlay) return;
+  const oc = overlay.getContext('2d');
+  const img = oc.createImageData(GW,GH);
+  const d = img.data;
+  for(let i=0;i<GW*GH;i++){
+    const o = owners[i];
+    if(o<0) continue;
+    const c = hexToRgb(colors[o]);
+    const idx = i*4;
+    d[idx]=c.r; d[idx+1]=c.g; d[idx+2]=c.b; d[idx+3]=alive[o]?170:60;
+  }
+  oc.putImageData(img,0,0);
+}
+
+const _hexCache = {};
+function hexToRgb(hex){
+  if(_hexCache[hex]) return _hexCache[hex];
+  const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+  return _hexCache[hex]={r,g,b};
+}
+
+// ── RENDER ───────────────────────────────────────────────────
+function renderTerrain(){
+  if(!offscreen) return;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const {x,y,scale} = view;
+  const dw = state.GW*scale, dh = state.GH*scale;
+  ctx.drawImage(offscreen, x, y, dw, dh);
+  if(overlay) ctx.drawImage(overlay, x, y, dw, dh);
+}
+
+function renderMinimap(){
+  const {GW,GH,owners,colors,alive,landMask} = state;
+  if(!owners) return;
+  const mw=mmCanvas.width, mh=mmCanvas.height;
+  const img = mmCtx.createImageData(mw,mh);
+  const d = img.data;
+  const sx=GW/mw, sy=GH/mh;
+  for(let py=0;py<mh;py++){
+    for(let px=0;px<mw;px++){
+      const gx=Math.floor(px*sx), gy=Math.floor(py*sy);
+      const gi=gy*GW+gx;
+      const o=owners[gi];
+      const idx=(py*mw+px)*4;
+      if(o>=0){
+        const c=hexToRgb(colors[o]);
+        d[idx]=c.r;d[idx+1]=c.g;d[idx+2]=c.b;d[idx+3]=200;
+      } else if(landMask[gi]){
+        d[idx]=90;d[idx+1]=110;d[idx+2]=70;d[idx+3]=255;
+      } else {
+        d[idx]=5;d[idx+1]=25;d[idx+2]=70;d[idx+3]=255;
+      }
+    }
+  }
+  mmCtx.putImageData(img,0,0);
+  // Viewport indicator
+  const vx=(-view.x/view.scale/state.GW)*mw;
+  const vy=(-view.y/view.scale/state.GH)*mh;
+  const vw=(canvas.width/view.scale/state.GW)*mw;
+  const vh=(canvas.height/view.scale/state.GH)*mh;
+  mmCtx.strokeStyle='rgba(255,255,255,0.6)';
+  mmCtx.lineWidth=1;
+  mmCtx.strokeRect(vx,vy,vw,vh);
+}
+
+// ── GAME INIT ────────────────────────────────────────────────
+function initGame(){
+  const {GW,GH} = state;
+  state.landMask = generateLandMask(GW,GH);
+  state.owners   = new Int16Array(GW*GH).fill(-1);
+  state.totalLand = state.landMask.reduce((a,b)=>a+b,0);
+
+  const N = CFG.AI_COUNT + 1; // player + AIs
+  state.troops   = new Float32Array(N);
+  state.tiles    = new Int32Array(N);
+  state.maxTroops= new Float32Array(N);
+  state.alive    = new Array(N).fill(true);
+  state.colors   = [PLAYER_COLORS[0], ...PLAYER_COLORS.slice(1,N)];
+  state.names    = ['You', ...NATION_NAMES.slice(0,CFG.AI_COUNT)];
+  state.expandQueue = Array.from({length:N},()=>[]);
+  state.tick = 0;
+
+  // Difficulty modifiers
+  state.diffMod = state.difficulty==='easy'?0.6 : state.difficulty==='hard'?1.5 : 1.0;
+
+  buildOffscreen();
+  buildOverlay();
+
+  // Spawn AI nations on random land tiles
+  const rng = mulberry32(Date.now()|0);
+  for(let p=1;p<N;p++){
+    let attempts=0;
+    while(attempts<2000){
+      const tx=Math.floor(rng()*GW), ty=Math.floor(rng()*GH);
+      const ti=ty*GW+tx;
+      if(state.landMask[ti] && state.owners[ti]<0){
+        spawnPlayer(p, tx, ty);
+        break;
+      }
+      attempts++;
+    }
+  }
+
+  updateOverlay();
+  centerView();
+  resize();
+}
+
+function spawnPlayer(p, tx, ty){
+  const {GW} = state;
+  const ti = ty*GW+tx;
+  state.owners[ti] = p;
+  state.tiles[p]++;
+  state.troops[p] = 50;
+  state.maxTroops[p] = calcMaxTroops(p);
+  // Init frontier
+  addFrontier(p, tx, ty);
+}
+
+function addFrontier(p, tx, ty){
+  const {GW,GH} = state;
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+  for(const [dx,dy] of dirs){
+    const nx=(tx+dx+GW)%GW, ny=ty+dy;
+    if(ny<0||ny>=GH) continue;
+    const ni=ny*GW+nx;
+    if(state.landMask[ni] && state.owners[ni]!==p){
+      state.expandQueue[p].push([nx,ny]);
+    }
+  }
+}
+
+function centerView(){
+  const s = Math.min(canvas.width/state.GW, canvas.height/state.GH)*0.9;
+  view.scale = Math.max(view.minScale, Math.min(view.maxScale, s));
+  view.x = (canvas.width - state.GW*view.scale)/2;
+  view.y = (canvas.height - state.GH*view.scale)/2;
+}
+
+// ── TROOP FORMULAS ───────────────────────────────────────────
+function calcMaxTroops(p){
+  const t = state.tiles[p];
+  return CFG.MAX_TROOP_SCALE*(Math.pow(t,0.6)*1000 + 50000);
+}
+
+function troopRegen(p){
+  const t = state.troops[p];
+  return CFG.TROOP_REGEN_BASE + Math.pow(t,0.73)/4;
+}
+
+// ── TICK ─────────────────────────────────────────────────────
+function gameTick(){
+  if(state.phase!=='play') return;
+  state.tick++;
+  const {GW,GH,owners,tiles,troops,maxTroops,alive,landMask,expandQueue,diffMod} = state;
+  const N = CFG.AI_COUNT+1;
+
+  // Regen troops
+  for(let p=0;p<N;p++){
+    if(!alive[p]||tiles[p]===0) continue;
+    maxTroops[p] = calcMaxTroops(p);
+    const regen = troopRegen(p) * (p===0?1:diffMod);
+    troops[p] = Math.min(maxTroops[p], troops[p]+regen);
+  }
+
+  // Expand
+  if(state.tick % CFG.EXPAND_INTERVAL === 0){
+    for(let p=0;p<N;p++){
+      if(!alive[p]||tiles[p]===0) continue;
+      if(troops[p]<20) continue; // need troops to expand
+
+      const q = expandQueue[p];
+      if(q.length===0) continue;
+
+      // How many tiles to try this tick
+      const attackPower = Math.max(1, Math.floor(tiles[p]*0.02 + troops[p]/500));
+      const tries = Math.min(attackPower, q.length, p===0?attackPower:Math.ceil(attackPower*diffMod));
+
+      for(let t=0;t<tries;t++){
+        if(q.length===0) break;
+        // Pick random frontier tile
+        const idx = Math.floor(Math.random()*q.length);
+        const [nx,ny] = q[idx];
+        q.splice(idx,1);
+        const ni = ny*GW+nx;
+        if(!landMask[ni]) continue;
+
+        const defender = owners[ni];
+        if(defender===p) continue; // already ours
+
+        // Combat: attacker needs enough troops
+        const defTroops = defender<0 ? 0 : troops[defender];
+        const atkStr = troops[p];
+        const defStr = defTroops*0.3; // defending tile is just a fraction
+
+        if(atkStr > defStr + 10){
+          // Capture
+          if(defender>=0){
+            tiles[defender]--;
+            troops[defender] = Math.max(0, troops[defender]-defStr*0.3);
+            if(tiles[defender]<=0){ alive[defender]=false; troops[defender]=0; }
+          }
+          troops[p] = Math.max(0, troops[p] - Math.max(1, defStr*0.1));
+          owners[ni] = p;
+          tiles[p]++;
+          addFrontier(p, nx, ny);
+        } else {
+          // Failed attack — put back later
+          q.push([nx,ny]);
+        }
+      }
+    }
+  }
+
+  // Shuffle AI queues occasionally for variety
+  if(state.tick%20===0){
+    for(let p=1;p<N;p++){
+      const q=expandQueue[p];
+      for(let i=q.length-1;i>0;i--){
+        const j=Math.floor(Math.random()*(i+1));
+        [q[i],q[j]]=[q[j],q[i]];
+      }
+    }
+  }
+
+  // Check win/lose
+  if(state.playerSpawned){
+    const pct = tiles[0]/state.totalLand;
+    if(pct >= CFG.WIN_PCT){ endGame(true); return; }
+    if(!alive[0] || tiles[0]===0){ endGame(false); return; }
+  }
+
+  // Update visuals every few ticks
+  if(state.tick%3===0) updateOverlay();
+  updateHUD();
+}
+
+// ── HUD UPDATE ───────────────────────────────────────────────
+function updateHUD(){
+  const {tiles,troops,maxTroops,totalLand,names,colors} = state;
+  const t=tiles[0], tr=Math.floor(troops[0]), mx=maxTroops[0]||1;
+  const pct=(t/totalLand*100).toFixed(1);
+  document.getElementById('hudNation').textContent = names[0];
+  document.getElementById('hudNation').style.color = colors[0];
+  document.getElementById('hudTiles').textContent = t.toLocaleString();
+  document.getElementById('hudTilesBar').style.width = Math.min(100,t/totalLand*100*1.25)+'%';
+  document.getElementById('hudTroops').textContent = tr.toLocaleString();
+  document.getElementById('hudTroopsBar').style.width = Math.min(100,tr/mx*100)+'%';
+  document.getElementById('hudPct').textContent = pct+'%';
+  document.getElementById('hudTick').textContent = state.tick;
+
+  // Status message
+  let msg='';
+  if(!state.playerSpawned) msg='Click any green land tile to spawn your nation!';
+  else if(t<10) msg='Grow your territory — expand aggressively!';
+  else if(t/totalLand<0.1) msg='Keep expanding — '+(CFG.WIN_PCT*100)+'% of land needed to win!';
+  else msg=`Controlling ${pct}% · ${(CFG.WIN_PCT*100-parseFloat(pct)).toFixed(1)}% more to win`;
+  document.getElementById('status').textContent=msg;
+}
+
+// ── END GAME ─────────────────────────────────────────────────
+function endGame(won){
+  state.phase='over';
+  clearInterval(state.tickTimer);
+
+  const {tiles,troops,totalLand,tick} = state;
+  const pct=(tiles[0]/totalLand*100).toFixed(1);
+  const survivors = state.alive.filter(Boolean).length-1;
+
+  document.getElementById('goTitle').textContent = won?'🏆 VICTORY!':'💀 DEFEATED';
+  document.getElementById('goTitle').style.color = won?'#4f8':'#f44';
+  document.getElementById('goDetail').textContent = won
+    ? `You conquered ${pct}% of Earth and achieved global dominance!`
+    : `Your nation fell after ${tick} ticks. ${survivors} rivals remain.`;
+  document.getElementById('goStats').innerHTML = `
+    <div class='stat-item'><div class='label'>Tiles Held</div><div class='val'>${tiles[0].toLocaleString()}</div></div>
+    <div class='stat-item'><div class='label'>Control</div><div class='val'>${pct}%</div></div>
+    <div class='stat-item'><div class='label'>Ticks Survived</div><div class='val'>${tick}</div></div>
+    <div class='stat-item'><div class='label'>AI Rivals Left</div><div class='val'>${survivors}</div></div>
+  `;
+  document.getElementById('gameOver').classList.remove('hidden');
+}
+
+// ── START GAME ───────────────────────────────────────────────
+function startGame(){
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('hud').classList.remove('hidden');
+  document.getElementById('bottomBar').classList.remove('hidden');
+  document.getElementById('controls-hint').style.display='block';
+  state.phase='play';
+  state.playerSpawned=false;
+  initGame();
+  renderLoop();
+  state.tickTimer = setInterval(()=>{
+    for(let s=0;s<state.speed;s++) gameTick();
+  }, CFG.TICK_MS);
+}
+
+function resetGame(){
+  clearInterval(state.tickTimer);
+  document.getElementById('gameOver').classList.add('hidden');
+  document.getElementById('hud').classList.add('hidden');
+  document.getElementById('bottomBar').classList.add('hidden');
+  document.getElementById('controls-hint').style.display='none';
+  document.getElementById('startScreen').classList.remove('hidden');
+  state.phase='start';
+  state.playerSpawned=false;
+  offscreen=null; overlay=null;
+}
+
+// ── RENDER LOOP ───────────────────────────────────────────────
+let rafId=null;
+function renderLoop(){
+  rafId=requestAnimationFrame(renderLoop);
+  renderTerrain();
+  if(state.tick%5===0) renderMinimap();
+}
+
+// ── INPUT — PAN & ZOOM ────────────────────────────────────────
+canvas.addEventListener('mousedown',e=>{
+  drag.active=true; drag.sx=e.clientX; drag.sy=e.clientY;
+  drag.svx=view.x; drag.svy=view.y; drag.moved=false;
+});
+canvas.addEventListener('mousemove',e=>{
+  if(!drag.active) return;
+  const dx=e.clientX-drag.sx, dy=e.clientY-drag.sy;
+  if(Math.abs(dx)>3||Math.abs(dy)>3) drag.moved=true;
+  view.x=drag.svx+dx; view.y=drag.svy+dy;
+});
+canvas.addEventListener('mouseup',e=>{
+  if(!drag.moved) handleClick(e.clientX,e.clientY);
+  drag.active=false;
+});
+canvas.addEventListener('mouseleave',()=>{drag.active=false;});
+
+// Touch support
+let lastTouchDist=0;
+canvas.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  if(e.touches.length===1){
+    drag.active=true; drag.moved=false;
+    drag.sx=e.touches[0].clientX; drag.sy=e.touches[0].clientY;
+    drag.svx=view.x; drag.svy=view.y;
+  } else if(e.touches.length===2){
+    lastTouchDist=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+  }
+},{passive:false});
+canvas.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  if(e.touches.length===1&&drag.active){
+    const dx=e.touches[0].clientX-drag.sx, dy=e.touches[0].clientY-drag.sy;
+    if(Math.abs(dx)>5||Math.abs(dy)>5) drag.moved=true;
+    view.x=drag.svx+dx; view.y=drag.svy+dy;
+  } else if(e.touches.length===2){
+    const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+    const ratio=d/lastTouchDist;
+    const mx=(e.touches[0].clientX+e.touches[1].clientX)/2;
+    const my=(e.touches[0].clientY+e.touches[1].clientY)/2;
+    zoomAt(mx,my,ratio);
+    lastTouchDist=d;
+  }
+},{passive:false});
+canvas.addEventListener('touchend',e=>{
+  if(e.changedTouches.length===1&&!drag.moved){
+    handleClick(e.changedTouches[0].clientX,e.changedTouches[0].clientY);
+  }
+  drag.active=false;
+},{passive:false});
+
+canvas.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const factor = e.deltaY<0?1.12:0.89;
+  zoomAt(e.clientX,e.clientY,factor);
+},{passive:false});
+
+function zoomAt(cx,cy,factor){
+  const ns=Math.max(view.minScale,Math.min(view.maxScale,view.scale*factor));
+  const ratio=ns/view.scale;
+  view.x=cx-(cx-view.x)*ratio;
+  view.y=cy-(cy-view.y)*ratio;
+  view.scale=ns;
+}
+
+function handleClick(cx,cy){
+  if(state.phase!=='play') return;
+  // Convert screen → grid
+  const gx=Math.floor((cx-view.x)/view.scale);
+  const gy=Math.floor((cy-view.y)/view.scale);
+  if(gx<0||gx>=state.GW||gy<0||gy>=state.GH) return;
+  const gi=gy*state.GW+gx;
+
+  if(!state.playerSpawned){
+    if(state.landMask[gi] && state.owners[gi]<0){
+      spawnPlayer(0, gx, gy);
+      state.playerSpawned=true;
+      document.getElementById('status').textContent='Nation spawned! Watch it grow and conquer!';
+    } else if(!state.landMask[gi]){
+      document.getElementById('status').textContent='That\'s ocean! Click on a land tile (green area).';
+    } else {
+      document.getElementById('status').textContent='That tile is already claimed — try another spot!';
+    }
+  }
+}
+
+// ── SPEED CONTROLS ────────────────────────────────────────────
+document.getElementById('slowBtn').addEventListener('click',()=>{
+  state.speed=Math.max(1,state.speed===1?1:state.speed/2);
+  document.getElementById('speedLabel').textContent=state.speed+'×';
+});
+document.getElementById('fastBtn').addEventListener('click',()=>{
+  state.speed=Math.min(8,state.speed*2);
+  document.getElementById('speedLabel').textContent=state.speed+'×';
+});
+
+// ── DIFFICULTY ────────────────────────────────────────────────
+document.querySelectorAll('.diff-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.diff-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    state.difficulty=btn.dataset.d;
+  });
+});
+
+// ── SCREEN BUTTONS ────────────────────────────────────────────
+document.getElementById('startBtn').addEventListener('click',startGame);
+document.getElementById('replayBtn').addEventListener('click',resetGame);
+document.getElementById('howtoBtn').addEventListener('click',()=>{
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('howtoScreen').classList.remove('hidden');
+});
+document.getElementById('backBtn').addEventListener('click',()=>{
+  document.getElementById('howtoScreen').classList.add('hidden');
+  document.getElementById('startScreen').classList.remove('hidden');
+});
+
+// ── BOOT ─────────────────────────────────────────────────────
+resize();
+// Draw a preview globe on start screen
+(function drawStartBg(){
+  resize();
+  // Just show a blue background — game starts fresh
+})();
+</script>
+</body>
+</html>
