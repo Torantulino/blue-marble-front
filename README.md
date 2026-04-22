@@ -124,3 +124,5 @@ Then replace the custom `SpacetimeDBClient` with the generated SDK.
 ## 📄 License
 
 MIT © 2026 Torantulino
+---
+
