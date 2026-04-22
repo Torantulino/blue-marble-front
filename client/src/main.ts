@@ -1,121 +1,7 @@
 // Blue Marble Front — M1 Alpha Client
 // Connects to SpacetimeDB, renders globe, handles multiplayer input.
 
-// ── SpacetimeDB SDK (lightweight wrapper until generated bindings are available) ──
-interface StdbRow {
-  id: number | bigint;
-  [key: string]: any;
-}
-
-class StdbTable<T extends StdbRow> {
-  rows = new Map<string, T>();
-  onInsertCb?: (row: T) => void;
-  onUpdateCb?: (oldRow: T, newRow: T) => void;
-  onDeleteCb?: (row: T) => void;
-
-  onInsert(cb: (row: T) => void) { this.onInsertCb = cb; }
-  onUpdate(cb: (oldRow: T, newRow: T) => void) { this.onUpdateCb = cb; }
-  onDelete(cb: (row: T) => void) { this.onDeleteCb = cb; }
-
-  insert(row: T) {
-    const key = String(row.id);
-    this.rows.set(key, row);
-    this.onInsertCb?.(row);
-  }
-  update(row: T) {
-    const key = String(row.id);
-    const old = this.rows.get(key);
-    this.rows.set(key, row);
-    if (old) this.onUpdateCb?.(old, row);
-    else this.onInsertCb?.(row);
-  }
-  delete(id: number | bigint) {
-    const key = String(id);
-    const old = this.rows.get(key);
-    if (old) {
-      this.rows.delete(key);
-      this.onDeleteCb?.(old);
-    }
-  }
-  iter(): T[] { return Array.from(this.rows.values()); }
-  find(pred: (row: T) => boolean): T | undefined { return this.iter().find(pred); }
-  filter(pred: (row: T) => boolean): T[] { return this.iter().filter(pred); }
-}
-
-class StdbReducerCaller {
-  constructor(private ws: WebSocket, private name: string) {}
-  call(reducer: string, args: any[]) {
-    this.ws.send(JSON.stringify({ type: 'call', reducer: `${this.name}/${reducer}`, args }));
-  }
-}
-
-class SpacetimeDBClient {
-  ws!: WebSocket;
-  db = {
-    matches: new StdbTable<any>(),
-    players: new StdbTable<any>(),
-    tile_chunks: new StdbTable<any>(),
-    attacks: new StdbTable<any>(),
-    cities: new StdbTable<any>(),
-    chat: new StdbTable<any>(),
-  };
-  reducers!: StdbReducerCaller;
-  identity: string = '';
-  token: string = '';
-  private connectCb?: (identity: string, token: string) => void;
-  private onRowCb?: (table: string, op: string, row: any) => void;
-
-  constructor(private url: string, private moduleName: string) {}
-
-  onConnect(cb: (identity: string, token: string) => void) { this.connectCb = cb; }
-
-  connect() {
-    this.ws = new WebSocket(this.url);
-    this.reducers = new StdbReducerCaller(this.ws, this.moduleName);
-    this.ws.onopen = () => {
-      this.ws.send(JSON.stringify({ type: 'identity' }));
-    };
-    this.ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      this.handleMessage(msg);
-    };
-  }
-
-  private handleMessage(msg: any) {
-    if (msg.type === 'identity') {
-      this.identity = msg.identity;
-      this.token = msg.token;
-      this.connectCb?.(this.identity, this.token);
-    } else if (msg.type === 'subscription') {
-      for (const row of msg.rows || []) {
-        this.upsertRow(msg.table, row);
-      }
-    } else if (msg.type === 'transaction') {
-      for (const up of msg.updates || []) {
-        if (up.op === 'insert') this.upsertRow(up.table, up.row);
-        else if (up.op === 'update') this.upsertRow(up.table, up.row);
-        else if (up.op === 'delete') this.deleteRow(up.table, up.row.id);
-      }
-    }
-  }
-
-  private upsertRow(table: string, row: any) {
-    const t = (this.db as any)[table] as StdbTable<any>;
-    if (!t) return;
-    t.update(row);
-    this.onRowCb?.(table, 'update', row);
-  }
-
-  private deleteRow(table: string, id: any) {
-    const t = (this.db as any)[table] as StdbTable<any>;
-    if (!t) return;
-    t.delete(id);
-  }
-
-  subscribe(queries: string[]) {
-    this.ws.send(JSON.stringify({ type: 'subscribe', queries }));
-  }
-}
+import { DbConnection, tables, reducers } from './generated/index';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const SIM_W = 1350;
@@ -123,22 +9,31 @@ const SIM_H = 675;
 const VISUAL_W = 5400;
 const VISUAL_H = 2700;
 const SCALE = VISUAL_W / SIM_W; // 4
+const CHUNK_SIZE = 32;
 const COLORS = ['#ee6633','#44cc88','#ff9900','#cc44ff','#00bbff','#ff4444','#88ff00','#ffaa00','#0088ff','#ff00cc','#00ffbb','#ffff44','#ff8844'];
 const VISUAL_URL = 'https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/may/world.200405.3x5400x2700.jpg';
 const PROXY = 'https://corsproxy.io/?';
 
+// Use maincloud for production; allow override via env for local dev
+const SPACETIMEDB_HOST = (import.meta as any).env?.VITE_SPACETIMEDB_HOST || 'wss://maincloud.spacetimedb.com';
+const MODULE_NAME = 'blue-marble-front';
+
+const PHASE_LOBBY = 0;
+const PHASE_SPAWN = 1;
+const PHASE_PLAYING = 2;
+const PHASE_ENDED = 3;
+
 // ── State ──────────────────────────────────────────────────────────────────────
-let client: SpacetimeDBClient;
-let myIdentity = '';
+let conn: DbConnection;
+let myIdentityHex = '';
 let myPlayerId = -1;
 let currentMatchId = -1;
-let currentPhase = 'Lobby';
+let currentPhase = PHASE_LOBBY;
 let earthImg: HTMLImageElement | null = null;
 let overlayCanvas: HTMLCanvasElement | null = null;
 let overlayCtx: CanvasRenderingContext2D | null = null;
 let overlayImageData: ImageData | null = null;
 let view = { x: 0, y: 0, scale: 1 };
-let gameStarted = false;
 let gameOver = false;
 let tickN = 0;
 let totalLand = 0;
@@ -187,31 +82,38 @@ function loadImg(url: string): Promise<HTMLImageElement> {
 // ── SpacetimeDB connection ─────────────────────────────────────────────────────
 function connectStdb() {
   setLoad(10, 'Connecting to SpacetimeDB…');
-  // Adjust URL to your SpacetimeDB host
-  const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/v1/database/blue-marble-front/subscribe';
-  client = new SpacetimeDBClient(wsUrl, 'blue-marble-front');
-  client.onConnect((identity, token) => {
-    myIdentity = identity;
-    setLoad(30, 'Subscribing to tables…');
-    client.subscribe([
-      'SELECT * FROM matches',
-      'SELECT * FROM players',
-      'SELECT * FROM tile_chunks',
-      'SELECT * FROM attacks',
-      'SELECT * FROM cities',
-      'SELECT * FROM chat',
-    ]);
-    setupDbListeners();
-    setLoad(50, 'Loading NASA imagery…');
-    loadNASAImages().then(() => {
-      setLoad(100, 'Ready!');
-      setTimeout(() => { hide(loading); show(startScreen); }, 400);
-    }).catch(err => {
-      loadMsg.textContent = '⚠️ Failed to load NASA imagery: ' + err.message;
+  conn = DbConnection.builder()
+    .withUri(SPACETIMEDB_HOST)
+    .withDatabaseName(MODULE_NAME)
+    .onConnect((connection: any, identity: any, token: any) => {
+      myIdentityHex = identity.toHexString();
+      setLoad(30, 'Subscribing to tables…');
+      connection.subscriptionBuilder()
+        .onApplied(() => {
+          setLoad(50, 'Loading NASA imagery…');
+          loadNASAImages().then(() => {
+            setLoad(100, 'Ready!');
+            setTimeout(() => { hide(loading); show(startScreen); }, 400);
+          }).catch((err: any) => {
+            loadMsg.textContent = '⚠️ Failed to load NASA imagery: ' + (err?.message || err);
+            loadBar.style.background = '#f44';
+          });
+        })
+        .subscribe(
+          tables.matches,
+          tables.players,
+          tables.tile_chunks,
+          tables.attacks,
+          tables.cities,
+          tables.chat
+        );
+      setupDbListeners();
+    })
+    .onConnectError((ctx: any, error: any) => {
+      loadMsg.textContent = '⚠️ Connection error: ' + error.message;
       loadBar.style.background = '#f44';
-    });
-  });
-  client.connect();
+    })
+    .build();
 }
 
 async function loadNASAImages() {
@@ -225,315 +127,114 @@ async function loadNASAImages() {
 
 // ── DB listeners ───────────────────────────────────────────────────────────────
 function setupDbListeners() {
-  client.db.matches.onUpdate((oldRow, newRow) => {
+  conn.db.matches.onUpdate((_ctx, oldRow, newRow) => {
     if (Number(newRow.id) === currentMatchId) {
       currentPhase = newRow.phase;
       tickN = Number(newRow.tick);
-      totalLand = Number(newRow.total_land);
-      document.getElementById('hudTick')!.textContent = String(tickN);
-      if (newRow.phase === 'Ended' && oldRow.phase !== 'Ended') {
+      totalLand = Number(newRow.totalLand);
+      const hudTick = document.getElementById('hudTick');
+      if (hudTick) hudTick.textContent = String(tickN);
+      if (newRow.phase === PHASE_ENDED && oldRow.phase !== PHASE_ENDED) {
         endGame(newRow.winner === myPlayerId);
       }
-      if (newRow.phase === 'Playing' && oldRow.phase === 'Spawn') {
+      if (newRow.phase === PHASE_PLAYING && oldRow.phase === PHASE_SPAWN) {
         status.textContent = 'Game started! Click enemy territory to attack.';
       }
     }
-    updateMatchList();
   });
-  client.db.matches.onInsert(() => updateMatchList());
 
-  client.db.players.onUpdate((_, p) => {
-    if (Number(p.match_id) !== currentMatchId) return;
-    if (p.identity === myIdentity && !p.is_bot) {
-      myPlayerId = Number(p.id);
-      updateHUD(p);
+  conn.db.players.onInsert((_ctx, row) => {
+    if (currentMatchId !== -1 && Number(row.matchId) === currentMatchId) {
+      updateLobbyPlayers();
     }
-    updateLobby();
+    if (row.identity.toHexString() === myIdentityHex && !row.isBot) {
+      myPlayerId = Number(row.id);
+      const hudNation = document.getElementById('hudNation');
+      if (hudNation) hudNation.textContent = row.name;
+    }
   });
-  client.db.players.onInsert((p) => {
-    if (Number(p.match_id) !== currentMatchId) return;
-    if (p.identity === myIdentity && !p.is_bot) myPlayerId = Number(p.id);
-    updateLobby();
+
+  conn.db.players.onUpdate((_ctx, _oldRow, newRow) => {
+    if (Number(newRow.id) === myPlayerId) {
+      const hudTiles = document.getElementById('hudTiles');
+      const hudTroops = document.getElementById('hudTroops');
+      const hudGold = document.getElementById('hudGold');
+      const hudPct = document.getElementById('hudPct');
+      const hudTilesBar = document.getElementById('hudTilesBar');
+      const hudTroopsBar = document.getElementById('hudTroopsBar');
+      if (hudTiles) hudTiles.textContent = String(newRow.tiles);
+      if (hudTroops) hudTroops.textContent = String(Math.floor(newRow.troops));
+      if (hudGold) hudGold.textContent = String(Math.floor(newRow.gold));
+      const pct = totalLand > 0 ? Math.floor((newRow.tiles / totalLand) * 100) : 0;
+      if (hudPct) hudPct.textContent = pct + '%';
+      if (hudTilesBar) hudTilesBar.style.width = pct + '%';
+      const troopPct = newRow.maxTroops > 0 ? Math.floor((newRow.troops / newRow.maxTroops) * 100) : 0;
+      if (hudTroopsBar) hudTroopsBar.style.width = troopPct + '%';
+    }
+    if (currentMatchId !== -1 && Number(newRow.matchId) === currentMatchId) {
+      updateLobbyPlayers();
+    }
   });
-  client.db.players.onDelete(() => updateLobby());
 
-  client.db.tile_chunks.onUpdate(() => requestOverlayUpdate());
-  client.db.tile_chunks.onInsert(() => requestOverlayUpdate());
+  conn.db.chat.onInsert((_ctx, row) => {
+    if (Number(row.matchId) === currentMatchId) {
+      const div = document.createElement('div');
+      div.className = 'chat-msg';
+      const fromName = getPlayerName(Number(row.from));
+      div.innerHTML = `<span class="chat-from">${escapeHtml(fromName)}:</span> ${escapeHtml(row.text)}`;
+      chatMessages.appendChild(div);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+  });
 
-  client.db.chat.onInsert((c) => {
-    if (Number(c.match_id) !== currentMatchId) return;
-    const div = document.createElement('div');
-    div.className = 'chat-msg';
-    const from = client.db.players.id().find(Number(c.from))?.name || '?';
-    div.innerHTML = `<span class="chat-from">${escapeHtml(from)}:</span> ${escapeHtml(c.text)}`;
-    chatMessages.appendChild(div);
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+  conn.db.attacks.onInsert((_ctx, row) => {
+    if (Number(row.attacker) === myPlayerId) {
+      status.textContent = 'Attacking ' + getPlayerName(Number(row.target)) + '!';
+    }
+  });
+
+  conn.db.attacks.onDelete((_ctx, row) => {
+    if (Number(row.attacker) === myPlayerId) {
+      status.textContent = 'Attack ended.';
+    }
   });
 }
 
-function escapeHtml(s: string) {
+function getPlayerName(pid: number): string {
+  for (const p of conn.db.players.iter()) {
+    if (Number(p.id) === pid) return p.name;
+  }
+  return '?';
+}
+
+function escapeHtml(s: string): string {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
 }
 
-// ── Overlay rendering from chunks ──────────────────────────────────────────────
-let overlayDirty = false;
-function requestOverlayUpdate() {
-  if (overlayDirty) return;
-  overlayDirty = true;
-  requestAnimationFrame(() => {
-    overlayDirty = false;
-    buildOverlay();
-  });
-}
-
-function buildOverlay() {
-  if (!overlayImageData) return;
-  const d = overlayImageData.data;
-  d.fill(0);
-  const chunks = client.db.tile_chunks.filter(c => Number(c.match_id) === currentMatchId);
-  for (const chunk of chunks) {
-    const cx = Number(chunk.chunk_x);
-    const cy = Number(chunk.chunk_y);
-    const owners: number[] = chunk.owners;
-    for (let ly = 0; ly < 32; ly++) {
-      for (let lx = 0; lx < 32; lx++) {
-        const tx = cx * 32 + lx;
-        const ty = cy * 32 + ly;
-        if (tx >= SIM_W || ty >= SIM_H) continue;
-        const ownerIdx = owners[ly * 32 + lx];
-        if (ownerIdx === 255) continue;
-        const color = hex2rgb(COLORS[ownerIdx % COLORS.length]);
-        // Upscale 4x to visual resolution
-        const vx = tx * SCALE;
-        const vy = ty * SCALE;
-        for (let dy = 0; dy < SCALE; dy++) {
-          for (let dx = 0; dx < SCALE; dx++) {
-            const px = vx + dx;
-            const py = vy + dy;
-            if (px >= VISUAL_W || py >= VISUAL_H) continue;
-            const idx = (py * VISUAL_W + px) * 4;
-            d[idx] = color.r;
-            d[idx + 1] = color.g;
-            d[idx + 2] = color.b;
-            d[idx + 3] = 180;
-          }
-        }
+// ── UI event handlers ──────────────────────────────────────────────────────────
+document.getElementById('btnCreate')!.addEventListener('click', () => {
+  const name = 'Match ' + Math.floor(Math.random() * 9999);
+  conn.reducers.createMatch({ name });
+  const check = setInterval(() => {
+    if (!myIdentityHex) return;
+    for (const m of conn.db.matches.iter()) {
+      if (m.creator.toHexString() === myIdentityHex) {
+        clearInterval(check);
+        currentMatchId = Number(m.id);
+        enterLobby();
+        break;
       }
     }
-  }
-  overlayCtx?.putImageData(overlayImageData, 0, 0);
-}
-
-function hex2rgb(h: string) {
-  const n = parseInt(h.slice(1), 16);
-  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
-}
-
-// ── Render loop ────────────────────────────────────────────────────────────────
-function render() {
-  ctx.fillStyle = '#000810';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  if (!earthImg) { requestAnimationFrame(render); return; }
-  const { x, y, scale } = view;
-  const dw = VISUAL_W * scale;
-  const dh = VISUAL_H * scale;
-  ctx.drawImage(earthImg, x, y, dw, dh);
-  if (overlayCanvas && gameStarted) ctx.drawImage(overlayCanvas, x, y, dw, dh);
-  requestAnimationFrame(render);
-}
-
-// ── HUD ────────────────────────────────────────────────────────────────────────
-function updateHUD(p: any) {
-  if (!p) return;
-  const t = Number(p.tiles);
-  const tr = Math.floor(Number(p.troops));
-  const g = Math.floor(Number(p.gold));
-  const mx = Number(p.max_troops);
-  const pct = totalLand > 0 ? (t / totalLand * 100).toFixed(1) : '0.0';
-  const color = COLORS[(p.color || 0) % COLORS.length];
-  document.getElementById('hudNation')!.textContent = 'You (' + color + ')';
-  (document.getElementById('hudNation') as HTMLElement).style.color = color;
-  document.getElementById('hudTiles')!.textContent = t.toLocaleString();
-  document.getElementById('hudTilesBar')!.style.width = Math.min(t / totalLand * 100 * 5, 100) + '%';
-  document.getElementById('hudTroops')!.textContent = tr.toLocaleString();
-  document.getElementById('hudTroopsBar')!.style.width = Math.min(tr / mx * 100, 100) + '%';
-  document.getElementById('hudGold')!.textContent = g.toLocaleString();
-  document.getElementById('hudPct')!.textContent = pct + '%';
-  document.getElementById('hudTick')!.textContent = String(tickN);
-  const alive = client.db.players.filter(p2 => Number(p2.match_id) === currentMatchId && p2.alive).length;
-  status.textContent = `Players alive: ${alive} | Your tiles: ${t.toLocaleString()} (${pct}%) | Gold: ${g.toLocaleString()}`;
-}
-
-// ── Minimap ────────────────────────────────────────────────────────────────────
-function updateMinimap() {
-  if (!earthImg || !overlayCanvas) return;
-  mmCtx.drawImage(earthImg, 0, 0, 270, 135);
-  mmCtx.drawImage(overlayCanvas, 0, 0, 270, 135);
-  const scx = 270 / VISUAL_W;
-  const scy = 135 / VISUAL_H;
-  const vx = -view.x / view.scale * scx;
-  const vy = -view.y / view.scale * scy;
-  const vw = canvas.width / view.scale * scx;
-  const vh = canvas.height / view.scale * scy;
-  mmCtx.strokeStyle = 'rgba(255,255,255,0.7)';
-  mmCtx.lineWidth = 1;
-  mmCtx.strokeRect(vx, vy, vw, vh);
-}
-setInterval(updateMinimap, 500);
-
-// ── View helpers ───────────────────────────────────────────────────────────────
-function clampView() {
-  const dw = VISUAL_W * view.scale;
-  const dh = VISUAL_H * view.scale;
-  const W = canvas.width;
-  const H = canvas.height;
-  if (dw <= W) view.x = (W - dw) / 2;
-  else view.x = Math.min(0, Math.max(W - dw, view.x));
-  if (dh <= H) view.y = (H - dh) / 2;
-  else view.y = Math.min(0, Math.max(H - dh, view.y));
-}
-
-function fitView() {
-  const scX = canvas.width / VISUAL_W;
-  const scY = canvas.height / VISUAL_H;
-  view.scale = Math.min(scX, scY);
-  view.x = (canvas.width - VISUAL_W * view.scale) / 2;
-  view.y = (canvas.height - VISUAL_H * view.scale) / 2;
-}
-
-// ── Input ──────────────────────────────────────────────────────────────────────
-let drag: { sx: number; sy: number } | null = null;
-let lastPinch = 0;
-
-canvas.addEventListener('mousedown', e => { drag = { sx: e.clientX - view.x, sy: e.clientY - view.y }; });
-window.addEventListener('mousemove', e => {
-  if (!drag) return;
-  view.x = e.clientX - drag.sx;
-  view.y = e.clientY - drag.sy;
-  clampView();
-});
-window.addEventListener('mouseup', () => { drag = null; });
-
-canvas.addEventListener('wheel', e => {
-  e.preventDefault();
-  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-  const cx = e.clientX;
-  const cy = e.clientY;
-  const oldScale = view.scale;
-  view.scale = Math.max(0.12, Math.min(view.scale * factor, 12));
-  const ef = view.scale / oldScale;
-  view.x = (view.x - cx) * ef + cx;
-  view.y = (view.y - cy) * ef + cy;
-  clampView();
-}, { passive: false });
-
-canvas.addEventListener('touchstart', e => {
-  if (e.touches.length === 1) drag = { sx: e.touches[0].clientX - view.x, sy: e.touches[0].clientY - view.y };
-  if (e.touches.length === 2) {
-    const dx = e.touches[0].clientX - e.touches[1].clientX;
-    const dy = e.touches[0].clientY - e.touches[1].clientY;
-    lastPinch = Math.sqrt(dx * dx + dy * dy);
-  }
-  e.preventDefault();
-}, { passive: false });
-canvas.addEventListener('touchmove', e => {
-  if (e.touches.length === 1 && drag) {
-    view.x = e.touches[0].clientX - drag.sx;
-    view.y = e.touches[0].clientY - drag.sy;
-    clampView();
-  }
-  if (e.touches.length === 2) {
-    const dx = e.touches[0].clientX - e.touches[1].clientX;
-    const dy = e.touches[0].clientY - e.touches[1].clientY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    const factor = dist / lastPinch;
-    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-    const oldScale = view.scale;
-    view.scale = Math.max(0.12, Math.min(view.scale * factor, 12));
-    const ef = view.scale / oldScale;
-    view.x = (view.x - cx) * ef + cx;
-    view.y = (view.y - cy) * ef + cy;
-    lastPinch = dist;
-    clampView();
-  }
-  e.preventDefault();
-}, { passive: false });
-canvas.addEventListener('touchend', () => { drag = null; });
-
-// Click handler: spawn / attack / inspect
-canvas.addEventListener('click', e => {
-  if (!gameStarted || gameOver) return;
-  if (drag && (Math.abs(e.clientX - drag.sx) > 5 || Math.abs(e.clientY - drag.sy) > 5)) return;
-  const worldX = (e.clientX - view.x) / view.scale;
-  const worldY = (e.clientY - view.y) / view.scale;
-  const gx = Math.floor(worldX / SCALE);
-  const gy = Math.floor(worldY / SCALE);
-  if (gx < 0 || gx >= SIM_W || gy < 0 || gy >= SIM_H) return;
-  const tile = gy * SIM_W + gx;
-
-  if (currentPhase === 'Spawn' && myPlayerId >= 0) {
-    const me = client.db.players.id().find(myPlayerId);
-    if (me && !me.spawn_tile) {
-      client.reducers.call('spawn', [currentMatchId, tile]);
-      status.textContent = 'Spawn request sent…';
-    }
-  } else if (currentPhase === 'Playing') {
-    const owner = getOwnerFromChunks(gx, gy);
-    const me = client.db.players.id().find(myPlayerId);
-    if (!me || !me.alive) return;
-    if (owner === null || owner === 255) {
-      status.textContent = '⚠️ That is ocean or unclaimed.';
-    } else if (owner === myPlayerId) {
-      status.textContent = 'Your territory. Use Build City to place a city here.';
-    } else {
-      // Attack
-      client.reducers.call('launch_attack', [currentMatchId, owner]);
-      status.textContent = 'Attack launched!';
-    }
-  }
-});
-
-function getOwnerFromChunks(tx: number, ty: number): number | null {
-  const cx = Math.floor(tx / 32);
-  const cy = Math.floor(ty / 32);
-  const lx = tx % 32;
-  const ly = ty % 32;
-  const chunk = client.db.tile_chunks.find(c =>
-    Number(c.match_id) === currentMatchId &&
-    Number(c.chunk_x) === cx &&
-    Number(c.chunk_y) === cy
-  );
-  if (!chunk) return null;
-  const idx = ly * 32 + lx;
-  const val = chunk.owners[idx];
-  return val === 255 ? null : val;
-}
-
-// ── UI Actions ─────────────────────────────────────────────────────────────────
-document.getElementById('btnCreate')!.addEventListener('click', () => {
-  const name = 'Match ' + Math.floor(Math.random() * 10000);
-  client.reducers.call('create_match', [name]);
-  // Wait for match to appear then join
-  const check = setInterval(() => {
-    const match = client.db.matches.find(m => m.name === name);
-    if (match) {
-      clearInterval(check);
-      currentMatchId = Number(match.id);
-      client.reducers.call('join_match', [currentMatchId, 'Player']);
-      hide(startScreen);
-      show(lobbyScreen);
-      updateLobby();
-    }
   }, 200);
+  setTimeout(() => clearInterval(check), 5000);
 });
 
 document.getElementById('btnList')!.addEventListener('click', () => {
   hide(startScreen);
   show(listScreen);
-  updateMatchList();
+  renderMatchList();
 });
 
 document.getElementById('btnBackFromList')!.addEventListener('click', () => {
@@ -542,16 +243,16 @@ document.getElementById('btnBackFromList')!.addEventListener('click', () => {
 });
 
 document.getElementById('btnStart')!.addEventListener('click', () => {
-  if (currentMatchId >= 0) {
-    client.reducers.call('start_match', [currentMatchId]);
+  if (currentMatchId !== -1) {
+    conn.reducers.startMatch({ matchId: BigInt(currentMatchId) });
   }
 });
 
 document.getElementById('btnAddBot')!.addEventListener('click', () => {
-  if (currentMatchId >= 0) {
-    const botNames = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot'];
-    const name = botNames[Math.floor(Math.random() * botNames.length)] + ' ' + Math.floor(Math.random() * 99);
-    client.reducers.call('add_bot', [currentMatchId, name]);
+  if (currentMatchId !== -1) {
+    const names = ['AlphaBot', 'BetaBot', 'GammaBot', 'DeltaBot', 'EpsilonBot'];
+    const botName = names[Math.floor(Math.random() * names.length)];
+    conn.reducers.addBot({ matchId: BigInt(currentMatchId), botName });
   }
 });
 
@@ -559,28 +260,26 @@ document.getElementById('btnLeave')!.addEventListener('click', () => {
   currentMatchId = -1;
   myPlayerId = -1;
   hide(lobbyScreen);
-  hide(hud);
-  hide(bottomBar);
   show(startScreen);
 });
 
 document.getElementById('btnBuildCity')!.addEventListener('click', () => {
-  if (currentPhase !== 'Playing' || myPlayerId < 0) return;
-  // For simplicity, build city on a random owned tile
-  const me = client.db.players.id().find(myPlayerId);
-  if (!me || !me.spawn_tile) return;
-  const tile = Number(me.spawn_tile);
-  client.reducers.call('build_city', [currentMatchId, tile]);
-  status.textContent = 'City build request sent.';
+  status.textContent = 'Click one of your tiles to build a city.';
+  if (currentMatchId !== -1 && myPlayerId !== -1) {
+    const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
+    if (me && me.spawnTile !== null && me.spawnTile !== undefined) {
+      conn.reducers.buildCity({ matchId: BigInt(currentMatchId), tile: me.spawnTile });
+    }
+  }
 });
 
 document.getElementById('btnRetreat')!.addEventListener('click', () => {
-  if (currentPhase !== 'Playing' || myPlayerId < 0) return;
-  const attacks = client.db.attacks.filter(a => Number(a.match_id) === currentMatchId && Number(a.attacker) === myPlayerId);
-  for (const a of attacks) {
-    client.reducers.call('retreat_attack', [currentMatchId, Number(a.target)]);
+  if (currentMatchId !== -1 && myPlayerId !== -1) {
+    const atk = Array.from(conn.db.attacks.iter()).find(a => Number(a.attacker) === myPlayerId);
+    if (atk) {
+      conn.reducers.retreatAttack({ matchId: BigInt(currentMatchId), targetPlayer: atk.target });
+    }
   }
-  status.textContent = 'Retreating all attacks.';
 });
 
 document.getElementById('btnChat')!.addEventListener('click', () => {
@@ -589,99 +288,311 @@ document.getElementById('btnChat')!.addEventListener('click', () => {
 });
 
 document.getElementById('chatSend')!.addEventListener('click', sendChat);
-document.getElementById('chatInput')!.addEventListener('keydown', e => {
+document.getElementById('chatInput')!.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') sendChat();
 });
+
 function sendChat() {
   const input = document.getElementById('chatInput') as HTMLInputElement;
   const text = input.value.trim();
-  if (!text || currentMatchId < 0) return;
-  client.reducers.call('send_chat', [currentMatchId, text]);
-  input.value = '';
+  if (text && currentMatchId !== -1) {
+    conn.reducers.sendChat({ matchId: BigInt(currentMatchId), text });
+    input.value = '';
+  }
 }
 
 document.getElementById('replayBtn')!.addEventListener('click', () => {
   location.reload();
 });
 
-// ── Lobby & Match List UI ──────────────────────────────────────────────────────
-function updateLobby() {
-  const container = document.getElementById('lobbyPlayers')!;
-  container.innerHTML = '';
-  const players = client.db.players.filter(p => Number(p.match_id) === currentMatchId);
-  for (const p of players) {
-    const div = document.createElement('div');
-    div.className = 'lobby-player';
-    const color = COLORS[(p.color || 0) % COLORS.length];
-    div.innerHTML = `<div class="dot" style="background:${color}"></div><div class="name">${escapeHtml(p.name)}</div><div class="tag">${p.is_bot ? 'BOT' : 'HUMAN'}</div>`;
-    container.appendChild(div);
-  }
-  // Auto-transition to game when phase changes
-  if (currentPhase === 'Playing' || currentPhase === 'Spawn') {
-    hide(lobbyScreen);
-    show(hud);
-    show(bottomBar);
-    gameStarted = true;
-    fitView();
-  }
-}
-
-function updateMatchList() {
-  const container = document.getElementById('matchList')!;
-  container.innerHTML = '';
-  const matches = client.db.matches.iter().filter(m => m.phase === 'Lobby');
-  for (const m of matches) {
+// ── Match list ─────────────────────────────────────────────────────────────────
+function renderMatchList() {
+  const list = document.getElementById('matchList')!;
+  list.innerHTML = '';
+  for (const m of conn.db.matches.iter()) {
+    if (m.phase !== PHASE_LOBBY) continue;
     const row = document.createElement('div');
     row.className = 'match-row';
-    const count = client.db.players.filter(p => Number(p.match_id) === Number(m.id)).length;
-    row.innerHTML = `<div class="mname">${escapeHtml(m.name)}</div><div class="mstatus">${count}/8 players</div>`;
+    const count = Array.from(conn.db.players.iter()).filter(p => Number(p.matchId) === Number(m.id)).length;
+    row.innerHTML = `<span class="mname">${escapeHtml(m.name)}</span><span class="mstatus">${count}/8</span>`;
     row.addEventListener('click', () => {
       currentMatchId = Number(m.id);
-      client.reducers.call('join_match', [currentMatchId, 'Player']);
-      hide(listScreen);
-      show(lobbyScreen);
-      updateLobby();
+      conn.reducers.joinMatch({ matchId: m.id, name: 'Player' });
+      enterLobby();
     });
-    container.appendChild(row);
+    list.appendChild(row);
+  }
+  if (list.children.length === 0) {
+    list.innerHTML = '<div style="color:#68a;text-align:center;">No open matches.</div>';
   }
 }
 
-// ── End game ───────────────────────────────────────────────────────────────────
+function enterLobby() {
+  hide(startScreen);
+  hide(listScreen);
+  show(lobbyScreen);
+  updateLobbyPlayers();
+}
+
+function updateLobbyPlayers() {
+  const container = document.getElementById('lobbyPlayers')!;
+  container.innerHTML = '';
+  for (const p of conn.db.players.iter()) {
+    if (Number(p.matchId) !== currentMatchId) continue;
+    const el = document.createElement('div');
+    el.className = 'lobby-player';
+    const color = COLORS[p.color % COLORS.length];
+    el.innerHTML = `<div class="dot" style="background:${color}"></div><span class="name">${escapeHtml(p.name)}</span><span class="tag">${p.isBot ? 'BOT' : 'HUMAN'}</span>`;
+    container.appendChild(el);
+  }
+}
+
+// ── Game over ──────────────────────────────────────────────────────────────────
 function endGame(won: boolean) {
   gameOver = true;
-  const title = document.getElementById('goTitle')!;
-  const detail = document.getElementById('goDetail')!;
-  const statsEl = document.getElementById('goStats')!;
-  title.textContent = won ? '🏆 Victory!' : '💀 Defeated';
-  title.style.color = won ? '#4f8' : '#f44';
-  const me = client.db.players.id().find(myPlayerId);
-  const t = me ? Number(me.tiles) : 0;
-  const pct = totalLand > 0 ? (t / totalLand * 100).toFixed(1) : '0.0';
-  detail.textContent = won
-    ? `You conquered ${pct}% of the planet in ${tickN} ticks!`
-    : `Your nation fell after ${tickN} ticks with ${t.toLocaleString()} tiles.`;
-  const alive = client.db.players.filter(p => Number(p.match_id) === currentMatchId && p.alive).length;
-  statsEl.innerHTML = `
-    <div class="stat-item"><div class="label">Ticks</div><div class="val">${tickN}</div></div>
-    <div class="stat-item"><div class="label">Tiles held</div><div class="val">${t.toLocaleString()}</div></div>
-    <div class="stat-item"><div class="label">Control</div><div class="val">${pct}%</div></div>
-    <div class="stat-item"><div class="label">Survivors</div><div class="val">${alive}</div></div>`;
   hide(hud);
   hide(bottomBar);
   hide(chatPanel);
   show(gameOverScreen);
+  document.getElementById('goTitle')!.textContent = won ? '🏆 Victory!' : '💀 Defeat';
+  const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
+  const tiles = me ? me.tiles : 0;
+  const troops = me ? Math.floor(me.troops) : 0;
+  const pct = totalLand > 0 ? Math.floor((tiles / totalLand) * 100) : 0;
+  document.getElementById('goDetail')!.textContent = won
+    ? `You conquered ${pct}% of Earth's land!`
+    : `You were eliminated after ${tickN} ticks.`;
+  document.getElementById('goStats')!.innerHTML = `
+    <div class="stat-item"><div class="label">Tiles</div><div class="val">${tiles}</div></div>
+    <div class="stat-item"><div class="label">Troops</div><div class="val">${troops}</div></div>
+    <div class="stat-item"><div class="label">Control</div><div class="val">${pct}%</div></div>
+    <div class="stat-item"><div class="label">Ticks</div><div class="val">${tickN}</div></div>
+  `;
 }
 
-// ── Boot ───────────────────────────────────────────────────────────────────────
-function resizeCanvas() {
+// ── Canvas rendering ───────────────────────────────────────────────────────────
+function resize() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  if (earthImg) clampView();
 }
-window.addEventListener('resize', resizeCanvas);
+window.addEventListener('resize', resize);
+resize();
 
-resizeCanvas();
+function worldToScreen(wx: number, wy: number) {
+  return {
+    x: (wx * view.scale - view.x),
+    y: (wy * view.scale - view.y),
+  };
+}
+
+function screenToWorld(sx: number, sy: number) {
+  return {
+    x: (sx + view.x) / view.scale,
+    y: (sy + view.y) / view.scale,
+  };
+}
+
+function render() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (earthImg) {
+    const tl = worldToScreen(0, 0);
+    const br = worldToScreen(VISUAL_W, VISUAL_H);
+    const w = br.x - tl.x;
+    const h = br.y - tl.y;
+    ctx.drawImage(earthImg, tl.x, tl.y, w, h);
+  }
+
+  if (overlayImageData && overlayCtx) {
+    const data = overlayImageData.data;
+    data.fill(0);
+
+    for (const chunk of conn.db.tile_chunks.iter()) {
+      if (Number(chunk.matchId) !== currentMatchId) continue;
+      const cx = chunk.chunkX;
+      const cy = chunk.chunkY;
+      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+        for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+          const tx = cx * CHUNK_SIZE + lx;
+          const ty = cy * CHUNK_SIZE + ly;
+          if (tx >= SIM_W || ty >= SIM_H) continue;
+          const idx = (ly * CHUNK_SIZE + lx);
+          const owner = chunk.owners[idx];
+          if (owner === 255) continue;
+          const color = hex2rgb(COLORS[owner % COLORS.length]);
+          const vx = tx * SCALE;
+          const vy = ty * SCALE;
+          for (let dy = 0; dy < SCALE; dy++) {
+            for (let dx = 0; dx < SCALE; dx++) {
+              const px = vx + dx;
+              const py = vy + dy;
+              const pi = (py * VISUAL_W + px) * 4;
+              data[pi] = color[0];
+              data[pi + 1] = color[1];
+              data[pi + 2] = color[2];
+              data[pi + 3] = 180;
+            }
+          }
+        }
+      }
+    }
+
+    overlayCtx.putImageData(overlayImageData, 0, 0);
+    const tl = worldToScreen(0, 0);
+    const br = worldToScreen(VISUAL_W, VISUAL_H);
+    ctx.drawImage(overlayCanvas!, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+  }
+
+  // Minimap
+  mmCtx.fillStyle = '#001122';
+  mmCtx.fillRect(0, 0, minimap.width, minimap.height);
+  const mmScaleX = minimap.width / VISUAL_W;
+  const mmScaleY = minimap.height / VISUAL_H;
+  for (const chunk of conn.db.tile_chunks.iter()) {
+    if (Number(chunk.matchId) !== currentMatchId) continue;
+    for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        const idx = (ly * CHUNK_SIZE + lx);
+        const owner = chunk.owners[idx];
+        if (owner === 255) continue;
+        const tx = chunk.chunkX * CHUNK_SIZE + lx;
+        const ty = chunk.chunkY * CHUNK_SIZE + ly;
+        mmCtx.fillStyle = COLORS[owner % COLORS.length];
+        mmCtx.fillRect(tx * mmScaleX, ty * mmScaleY, mmScaleX + 0.5, mmScaleY + 0.5);
+      }
+    }
+  }
+  // Viewport rect on minimap
+  mmCtx.strokeStyle = '#fff';
+  mmCtx.lineWidth = 1;
+  const vpx = view.x / view.scale * mmScaleX;
+  const vpy = view.y / view.scale * mmScaleY;
+  const vpw = canvas.width / view.scale * mmScaleX;
+  const vph = canvas.height / view.scale * mmScaleY;
+  mmCtx.strokeRect(vpx, vpy, vpw, vph);
+
+  requestAnimationFrame(render);
+}
+
+function hex2rgb(hex: string): [number, number, number] {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return [r, g, b];
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────────
+let dragging = false;
+let dragStart = { x: 0, y: 0 };
+let viewStart = { x: 0, y: 0 };
+
+canvas.addEventListener('mousedown', (e) => {
+  dragging = true;
+  dragStart = { x: e.clientX, y: e.clientY };
+  viewStart = { x: view.x, y: view.y };
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (dragging) {
+    view.x = viewStart.x - (e.clientX - dragStart.x);
+    view.y = viewStart.y - (e.clientY - dragStart.y);
+    clampView();
+  }
+});
+
+window.addEventListener('mouseup', () => { dragging = false; });
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const zoom = e.deltaY > 0 ? 0.9 : 1.1;
+  const oldScale = view.scale;
+  view.scale *= zoom;
+  view.scale = Math.max(0.2, Math.min(5, view.scale));
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  view.x = mx - (mx + view.x) * (view.scale / oldScale);
+  view.y = my - (my + view.y) * (view.scale / oldScale);
+  clampView();
+}, { passive: false });
+
+function clampView() {
+  const maxX = VISUAL_W * view.scale - canvas.width;
+  const maxY = VISUAL_H * view.scale - canvas.height;
+  view.x = Math.max(0, Math.min(maxX, view.x));
+  view.y = Math.max(0, Math.min(maxY, view.y));
+}
+
+canvas.addEventListener('click', (e) => {
+  if (dragging) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const w = screenToWorld(sx, sy);
+  const tx = Math.floor(w.x / SCALE);
+  const ty = Math.floor(w.y / SCALE);
+  if (tx < 0 || tx >= SIM_W || ty < 0 || ty >= SIM_H) return;
+  const tile = ty * SIM_W + tx;
+
+  if (currentMatchId === -1 || myPlayerId === -1) return;
+
+  if (currentPhase === PHASE_SPAWN) {
+    conn.reducers.spawn({ matchId: BigInt(currentMatchId), tile });
+  } else if (currentPhase === PHASE_PLAYING) {
+    // Attack: find who owns this tile
+    for (const chunk of conn.db.tile_chunks.iter()) {
+      if (Number(chunk.matchId) !== currentMatchId) continue;
+      const cx = Math.floor(tx / CHUNK_SIZE);
+      const cy = Math.floor(ty / CHUNK_SIZE);
+      if (chunk.chunkX !== cx || chunk.chunkY !== cy) continue;
+      const lx = tx % CHUNK_SIZE;
+      const ly = ty % CHUNK_SIZE;
+      const idx = ly * CHUNK_SIZE + lx;
+      const owner = chunk.owners[idx];
+      if (owner !== 255 && owner !== myPlayerId) {
+        conn.reducers.launchAttack({ matchId: BigInt(currentMatchId), targetPlayer: owner });
+      }
+      break;
+    }
+  }
+});
+
+// Touch support
+let touchStartDist = 0;
+let touchStartScale = 1;
+
+canvas.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 1) {
+    dragging = true;
+    dragStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    viewStart = { x: view.x, y: view.y };
+  } else if (e.touches.length === 2) {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    touchStartDist = Math.sqrt(dx * dx + dy * dy);
+    touchStartScale = view.scale;
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  if (e.touches.length === 1 && dragging) {
+    view.x = viewStart.x - (e.touches[0].clientX - dragStart.x);
+    view.y = viewStart.y - (e.touches[0].clientY - dragStart.y);
+    clampView();
+  } else if (e.touches.length === 2) {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const zoom = dist / touchStartDist;
+    view.scale = Math.max(0.2, Math.min(5, touchStartScale * zoom));
+    clampView();
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchend', () => { dragging = false; });
+
+// ── Boot ───────────────────────────────────────────────────────────────────────
 connectStdb();
-render();
+requestAnimationFrame(render);

@@ -1,5 +1,4 @@
-use spacetimedb::{ReducerContext, Table, Timestamp, Identity};
-use std::time::Duration;
+use spacetimedb::{ReducerContext, Table, Timestamp, Identity, TimeDuration, ScheduleAt};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const SIM_W: u32 = 1350;
@@ -77,10 +76,13 @@ fn rng_range(seed: u64, max: u32) -> (u64, u32) {
 // ── Tables ───────────────────────────────────────────────────────────────────
 
 #[spacetimedb::table(name = matches, public)]
+#[derive(Clone)]
 pub struct Match {
     #[primary_key]
     #[auto_inc]
     id: u64,
+    #[index(btree)]
+    creator: Identity,
     name: String,
     tick: u64,
     phase: u8,
@@ -90,6 +92,7 @@ pub struct Match {
 }
 
 #[spacetimedb::table(name = players, public)]
+#[derive(Clone)]
 pub struct Player {
     #[primary_key]
     #[auto_inc]
@@ -112,6 +115,7 @@ pub struct Player {
 }
 
 #[spacetimedb::table(name = tile_chunks, public)]
+#[derive(Clone)]
 pub struct TileChunk {
     #[primary_key]
     id: u64, // match_id << 32 | chunk_idx
@@ -124,6 +128,7 @@ pub struct TileChunk {
 }
 
 #[spacetimedb::table(name = attacks, public)]
+#[derive(Clone)]
 pub struct Attack {
     #[primary_key]
     #[auto_inc]
@@ -137,6 +142,7 @@ pub struct Attack {
 }
 
 #[spacetimedb::table(name = cities, public)]
+#[derive(Clone)]
 pub struct City {
     #[primary_key]
     #[auto_inc]
@@ -151,6 +157,7 @@ pub struct City {
 }
 
 #[spacetimedb::table(name = chat, public)]
+#[derive(Clone)]
 pub struct Chat {
     #[primary_key]
     #[auto_inc]
@@ -162,12 +169,22 @@ pub struct Chat {
     ts: u64,
 }
 
+#[spacetimedb::table(name = tick_schedule, scheduled(tick))]
+#[derive(Clone)]
+pub struct TickSchedule {
+    #[primary_key]
+    #[auto_inc]
+    scheduled_id: u64,
+    scheduled_at: ScheduleAt,
+}
+
 // ── Reducers ─────────────────────────────────────────────────────────────────
 
 #[spacetimedb::reducer]
-pub fn create_match(ctx: &ReducerContext, name: String) -> Result<u64, String> {
+pub fn create_match(ctx: &ReducerContext, name: String) -> Result<(), String> {
     let m = Match {
         id: 0,
+        creator: ctx.sender,
         name,
         tick: 0,
         phase: PHASE_LOBBY,
@@ -175,12 +192,12 @@ pub fn create_match(ctx: &ReducerContext, name: String) -> Result<u64, String> {
         winner: None,
         total_land: 0,
     };
-    let id = ctx.db.matches().insert(m).id;
-    Ok(id)
+    ctx.db.matches().insert(m);
+    Ok(())
 }
 
 #[spacetimedb::reducer]
-pub fn join_match(ctx: &ReducerContext, match_id: u64, name: String) -> Result<u32, String> {
+pub fn join_match(ctx: &ReducerContext, match_id: u64, name: String) -> Result<(), String> {
     let m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
     if m.phase != PHASE_LOBBY {
         return Err("Match already started".to_string());
@@ -207,12 +224,12 @@ pub fn join_match(ctx: &ReducerContext, match_id: u64, name: String) -> Result<u
         city_count: 0,
         city_levels: 0,
     };
-    let pid = ctx.db.players().insert(p).id;
-    Ok(pid)
+    ctx.db.players().insert(p);
+    Ok(())
 }
 
 #[spacetimedb::reducer]
-pub fn add_bot(ctx: &ReducerContext, match_id: u64, bot_name: String) -> Result<u32, String> {
+pub fn add_bot(ctx: &ReducerContext, match_id: u64, bot_name: String) -> Result<(), String> {
     let m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
     if m.phase != PHASE_LOBBY {
         return Err("Match already started".to_string());
@@ -239,8 +256,8 @@ pub fn add_bot(ctx: &ReducerContext, match_id: u64, bot_name: String) -> Result<
         city_count: 0,
         city_levels: 0,
     };
-    let pid = ctx.db.players().insert(p).id;
-    Ok(pid)
+    ctx.db.players().insert(p);
+    Ok(())
 }
 
 #[spacetimedb::reducer]
@@ -270,7 +287,7 @@ fn generate_terrain(ctx: &ReducerContext, match_id: u64) -> Result<(), String> {
                     } else {
                         let fx = tx as f32 / SIM_W as f32 * 6.28;
                         let fy = ty as f32 / SIM_H as f32 * 6.28;
-                        let n = (fx.sin() * 2.0 + fy.cos() * 1.5 + ((fx * 2.3).sin() + (fy * 1.7).cos()) * 0.5);
+                        let n = fx.sin() * 2.0 + fy.cos() * 1.5 + ((fx * 2.3).sin() + (fy * 1.7).cos()) * 0.5;
                         let lat_factor = 1.0 - ((ty as f32 / SIM_H as f32 - 0.5) * 2.0).abs();
                         n * lat_factor > 0.2
                     };
@@ -440,6 +457,7 @@ pub fn build_city(ctx: &ReducerContext, match_id: u64, tile: u32) -> Result<(), 
     if p.gold < cost {
         return Err("Not enough gold".to_string());
     }
+    let owner_id = p.id;
     p.gold -= cost;
     p.city_count += 1;
     p.city_levels += 1;
@@ -448,7 +466,7 @@ pub fn build_city(ctx: &ReducerContext, match_id: u64, tile: u32) -> Result<(), 
     let city = City {
         id: 0,
         match_id,
-        owner_id: p.id,
+        owner_id,
         tile,
         level: 1,
         under_construction: false,
@@ -469,7 +487,7 @@ pub fn send_chat(ctx: &ReducerContext, match_id: u64, text: String) -> Result<()
         match_id,
         from: p.id,
         text,
-        ts: ctx.timestamp.into_micros_since_epoch() as u64 / 1000,
+        ts: ctx.timestamp.to_micros_since_unix_epoch() as u64 / 1000,
     };
     ctx.db.chat().insert(chat);
     Ok(())
@@ -477,26 +495,17 @@ pub fn send_chat(ctx: &ReducerContext, match_id: u64, text: String) -> Result<()
 
 // ── Scheduled Tick ───────────────────────────────────────────────────────────
 
-#[spacetimedb::reducer]
+#[spacetimedb::reducer(init)]
 pub fn init(ctx: &ReducerContext) {
-    let _ = ctx.db.schedule().insert(spacetimedb::schedule::ScheduledReducer {
-        id: 0,
-        time: ctx.timestamp,
-        reducer_name: "tick".to_string(),
-        args: vec![],
+    let loop_duration = TimeDuration::from_micros((TICK_MS * 1000) as i64);
+    ctx.db.tick_schedule().insert(TickSchedule {
+        scheduled_id: 0,
+        scheduled_at: loop_duration.into(),
     });
 }
 
 #[spacetimedb::reducer]
-pub fn tick(ctx: &ReducerContext) {
-    let next = ctx.timestamp + Duration::from_millis(TICK_MS);
-    let _ = ctx.db.schedule().insert(spacetimedb::schedule::ScheduledReducer {
-        id: 0,
-        time: next,
-        reducer_name: "tick".to_string(),
-        args: vec![],
-    });
-
+pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) {
     let active_matches: Vec<_> = ctx.db.matches().iter()
         .filter(|m| m.phase == PHASE_PLAYING || m.phase == PHASE_SPAWN)
         .collect();

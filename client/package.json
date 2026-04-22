@@ -8,7 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@spacetimedb/sdk": "^1.0.0"
+    "spacetimedb": "^2.1.0"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
