@@ -53,7 +53,7 @@ const lobbyScreen = document.getElementById('lobbyScreen') as HTMLDivElement;
 const hud = document.getElementById('hud') as HTMLDivElement;
 const bottomBar = document.getElementById('bottomBar') as HTMLDivElement;
 const gameOverScreen = document.getElementById('gameOver') as HTMLDivElement;
-const status = document.getElementById('status') as HTMLDivElement;
+const statusEl = document.getElementById('status') as HTMLDivElement;
 const chatPanel = document.getElementById('chatPanel') as HTMLDivElement;
 const chatMessages = document.getElementById('chatMessages') as HTMLDivElement;
 
@@ -138,7 +138,7 @@ function setupDbListeners() {
         endGame(newRow.winner === myPlayerId);
       }
       if (newRow.phase === PHASE_PLAYING && oldRow.phase === PHASE_SPAWN) {
-        status.textContent = 'Game started! Click enemy territory to attack.';
+        statusEl.textContent = 'Game started! Click enemy territory to attack.';
       }
     }
   });
@@ -189,13 +189,13 @@ function setupDbListeners() {
 
   conn.db.attacks.onInsert((_ctx, row) => {
     if (Number(row.attacker) === myPlayerId) {
-      status.textContent = 'Attacking ' + getPlayerName(Number(row.target)) + '!';
+      statusEl.textContent = 'Attacking ' + getPlayerName(Number(row.target)) + '!';
     }
   });
 
   conn.db.attacks.onDelete((_ctx, row) => {
     if (Number(row.attacker) === myPlayerId) {
-      status.textContent = 'Attack ended.';
+      statusEl.textContent = 'Attack ended.';
     }
   });
 }
@@ -264,7 +264,7 @@ document.getElementById('btnLeave')!.addEventListener('click', () => {
 });
 
 document.getElementById('btnBuildCity')!.addEventListener('click', () => {
-  status.textContent = 'Click one of your tiles to build a city.';
+  statusEl.textContent = 'Click one of your tiles to build a city.';
   if (currentMatchId !== -1 && myPlayerId !== -1) {
     const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
     if (me && me.spawnTile !== null && me.spawnTile !== undefined) {
@@ -279,6 +279,7 @@ document.getElementById('btnRetreat')!.addEventListener('click', () => {
     if (atk) {
       conn.reducers.retreatAttack({ matchId: BigInt(currentMatchId), targetPlayer: atk.target });
     }
+    statusEl.textContent = 'Retreating all attacks.';
   }
 });
 
