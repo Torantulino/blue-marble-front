@@ -44,7 +44,7 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           cd spacetime-module
           spacetime build
-          spacetime publish --non-interactive blue-marble-front
+          spacetime publish --yes blue-marble-front
 
       - name: Generate TypeScript Bindings
         run: |
