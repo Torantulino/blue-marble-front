@@ -1,0 +1,13 @@
+{
+  "name": "blue-marble-front",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build:module": "cd spacetime-module && spacetime build",
+    "publish:module": "cd spacetime-module && spacetime publish blue-marble-front",
+    "build:client": "cd client && npm install && npm run build",
+    "dev:client": "cd client && npm install && npm run dev",
+    "build": "npm run build:module && npm run build:client",
+    "clean": "rm -rf client/node_modules client/dist spacetime-module/target"
+  }
+}

@@ -17,7 +17,7 @@ No install. No sign-up. Runs in any modern browser on desktop or mobile.
 
 ## 🗺️ What Is It?
 
-Blue Marble Front is a massively-multiplayer-inspired RTS where you claim territory on a real-world Earth map, grow your population, and expand outward against AI rival nations. Conquer **80% of all land tiles** to achieve global dominance.
+Blue Marble Front is a massively-multiplayer-inspired RTS where you claim territory on a real-world Earth map, grow your population, and expand outward against rival nations. Conquer **80% of all land tiles** to achieve global dominance.
 
 ---
 
@@ -25,20 +25,21 @@ Blue Marble Front is a massively-multiplayer-inspired RTS where you claim territ
 
 | Action | How |
 |--------|-----|
-| **Spawn** | Click any unclaimed land tile (green) |
+| **Spawn** | Click any unclaimed land tile |
 | **Expand** | Your nation auto-expands each tick |
+| **Attack** | Click an enemy territory to launch an attack |
+| **Retreat** | Press the Retreat button to cancel attacks |
+| **Build City** | Spend gold to build a city (boosts troop cap) |
 | **Win** | Hold 80% of Earth's land tiles |
 | **Lose** | All your tiles get captured |
 | **Pan** | Click & drag the map |
 | **Zoom** | Scroll wheel / pinch-to-zoom |
-| **Speed** | ½× / 2× buttons at the bottom |
-
-Choose **Easy**, **Normal**, or **Hard** before starting — difficulty scales AI aggression and expansion rate.
 
 ---
 
-## 🌐 Features (M0 Prototype)
+## 🌐 Features
 
+### M0 Prototype
 - 🗺️ **Procedural Earth land mask** — biome-tinted continents with real geography
 - 🎨 **Per-nation colour overlay** — see the world get painted in real time
 - 🤖 **12 AI nations** — each with their own frontier queue and troop dynamics
@@ -48,6 +49,15 @@ Choose **Easy**, **Normal**, or **Hard** before starting — difficulty scales A
 - 📱 **Mobile-friendly** — touch pan/pinch-zoom fully supported
 - 🏆 **Win / defeat screens** with stat summary
 
+### M1 Alpha — SpacetimeDB Multiplayer
+- 🔗 **SpacetimeDB backend** — authoritative 10 Hz server-side simulation
+- 👥 **Multiplayer matches** — up to 8 players + bots
+- 💬 **In-game chat**
+- 🏙️ **Cities** — spend gold to increase troop capacity
+- 💰 **Passive gold economy** — 100/s humans, 50/s bots
+- ⚔️ **Attack & Retreat** — manual combat against specific enemies
+- 🤖 **Bot AI** — auto-spawn, expand, and attack
+
 ---
 
 ## 🛠️ Tech
@@ -55,21 +65,59 @@ Choose **Easy**, **Normal**, or **Hard** before starting — difficulty scales A
 | | |
 |-|---|
 | **Renderer** | Canvas 2D — zero dependencies |
-| **World model** | 540×270 tile equirectangular grid |
+| **World model** | 1350×675 tile equirectangular grid (chunked 32×32) |
+| **Backend** | SpacetimeDB Rust module (10 Hz tick) |
+| **Client** | Vite + TypeScript |
 | **Combat** | Troop-strength comparison with frontline attrition |
-| **Troop model** | `max = 2×(tiles^0.6×1000+50000)`, regen tapers to capacity |
-| **Land mask** | Seeded procedural generation from continent bounding boxes |
-| **Deployment** | GitHub Pages (single `index.html`) |
+| **Troop model** | `max = 2×(tiles^0.6×1000+50000) + cities×250k`, regen tapers to capacity |
+| **Deployment** | GitHub Pages (client) + SpacetimeDB Cloud (backend) |
+
+---
+
+## 🏗️ Development
+
+### Prerequisites
+- [Rust](https://rustup.rs/) + [SpacetimeDB CLI](https://spacetimedb.com/docs/getting-started)
+- [Node.js](https://nodejs.org/) 18+
+
+### 1. Run the SpacetimeDB module locally
+
+```bash
+cd spacetime-module
+spacetime build
+spacetime publish --project-path . blue-marble-front
+```
+
+### 2. Run the client
+
+```bash
+cd client
+npm install
+npm run dev
+```
+
+The client will connect to `ws://localhost:3000` by default. Adjust the WebSocket URL in `src/main.ts` if your SpacetimeDB host differs.
+
+### 3. Generate TypeScript bindings (recommended)
+
+Instead of the lightweight wrapper in `src/main.ts`, you can generate official SDK bindings:
+
+```bash
+spacetime generate --lang typescript --out-dir ../client/src/generated --project-path ./spacetime-module
+```
+
+Then replace the custom `SpacetimeDBClient` with the generated SDK.
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] **M1** — SpacetimeDB multiplayer backend (Rust, 10 Hz tick)
-- [ ] **M2** — NASA Blue Marble WebGL globe (three.js icosphere)
-- [ ] **M3** — Structures: cities, ports, missile silos
-- [ ] **M4** — Diplomacy, alliances, nukes
-- [ ] **M5** — Full multiplayer matchmaking & live ops
+- [x] **M0** — Prototype: local sim, Canvas 2D, AI nations
+- [x] **M1** — Alpha: SpacetimeDB multiplayer, 8 players, growth + attack + retreat, passive gold, cities
+- [ ] **M2** — Beta: Ports, Warships, Trade Ships, Defence Posts, alliances, embargos, donate, chat
+- [ ] **M3** — Pre-launch: Silos, SAMs, Atom/Hydrogen/MIRV, Factories + Trains, replays, cosmetics shop
+- [ ] **M4** — Launch: 100-player public match, marketing, localisation 8 langs
+- [ ] **M5** — Season 1: Persistent globe meta, battle pass, mobile polish
 
 ---
 
