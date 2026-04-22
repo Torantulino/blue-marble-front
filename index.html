@@ -158,8 +158,8 @@ const status=document.getElementById('status');
 // ── Utilities ────────────────────────────────────────────────────────────────
 function hex2rgb(h){const n=parseInt(h.slice(1),16);return{r:(n>>16)&255,g:(n>>8)&255,b:n&255};}
 function setLoad(pct,msg){loadBar.style.width=pct+'%';loadMsg.textContent=msg;}
-function show(el){el.classList.remove('hidden');}
-function hide(el){el.classList.add('hidden');}
+function show(el){el.style.display='flex';el.classList.remove('hidden');}
+function hide(el){el.style.display='none';el.classList.add('hidden');}
 
 // ── Image loader with CORS + proxy fallback ───────────────────────────────────
 function loadImg(url){
