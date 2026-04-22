@@ -42,6 +42,7 @@ jobs:
           SPACETIMEDB_TOKEN: ${{ secrets.SPACETIMEDB_TOKEN }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
+          spacetime login --token "$SPACETIMEDB_TOKEN"
           cd spacetime-module
           spacetime build
           spacetime publish --yes blue-marble-front
