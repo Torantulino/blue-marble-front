@@ -266,6 +266,12 @@ function computeMax(p){
   return 2*(Math.pow(t,0.6)*1000+50000);
 }
 
+// ── Steps per tick (scales with speed multiplier) ─────────────────────────────
+function stepsForPlayer(p){
+  const base=(p===0)?40:(difficulty==='hard'?75:difficulty==='easy'?30:50);
+  return Math.max(1,Math.round(base*speedMult));
+}
+
 // ── Sim tick ─────────────────────────────────────────────────────────────────
 function simTick(){
   if(gameOver)return;
@@ -283,8 +289,7 @@ function simTick(){
   // Expand — each live player tries to claim from its queue
   for(let p=0;p<N;p++){
     if(!alive[p]||expandQueues[p].length===0)continue;
-    // AI expand faster if hard, player normal
-    const steps=(p===0)?1:(difficulty==='hard'?3:difficulty==='easy'?1:2);
+    const steps=stepsForPlayer(p);
     for(let s=0;s<steps;s++){
       if(expandQueues[p].length===0)break;
       const ri=Math.floor(Math.random()*Math.min(expandQueues[p].length,64));
@@ -540,7 +545,7 @@ document.getElementById('startBtn').addEventListener('click',()=>{
       }
       for(let p=1;p<N;p++){
         if(!alive[p]||expandQueues[p].length===0)continue;
-        const steps=difficulty==='hard'?3:2;
+        const steps=stepsForPlayer(p);
         for(let s=0;s<steps;s++){
           if(expandQueues[p].length===0)break;
           const ri=Math.floor(Math.random()*Math.min(expandQueues[p].length,64));
