@@ -99,14 +99,14 @@ function connectStdb() {
             loadBar.style.background = '#f44';
           });
         })
-        .subscribe(
+        .subscribe([
           tables.matches,
           tables.players,
           tables.tile_chunks,
           tables.attacks,
           tables.cities,
-          tables.chat
-        );
+          tables.chat,
+        ]);
       setupDbListeners();
     })
     .onConnectError((ctx: any, error: any) => {
@@ -136,6 +136,12 @@ function setupDbListeners() {
       if (hudTick) hudTick.textContent = String(tickN);
       if (newRow.phase === PHASE_ENDED && oldRow.phase !== PHASE_ENDED) {
         endGame(newRow.winner === myPlayerId);
+      }
+      if (oldRow.phase === PHASE_LOBBY && newRow.phase !== PHASE_LOBBY) {
+        hide(lobbyScreen);
+        show(hud);
+        show(bottomBar);
+        statusEl.textContent = 'Click a land tile to spawn your nation!';
       }
       if (newRow.phase === PHASE_PLAYING && oldRow.phase === PHASE_SPAWN) {
         statusEl.textContent = 'Game started! Click enemy territory to attack.';
@@ -223,6 +229,7 @@ document.getElementById('btnCreate')!.addEventListener('click', () => {
       if (m.creator.toHexString() === myIdentityHex) {
         clearInterval(check);
         currentMatchId = Number(m.id);
+        conn.reducers.joinMatch({ matchId: m.id, name: 'Player' });
         enterLobby();
         break;
       }
