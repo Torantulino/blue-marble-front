@@ -16,3 +16,7 @@ spacetime-module/Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Build output
+dist/
+dist/
