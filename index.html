@@ -444,9 +444,11 @@ canvas.addEventListener('wheel',e=>{
   e.preventDefault();
   const factor=e.deltaY<0?1.15:1/1.15;
   const cx=e.clientX,cy=e.clientY;
-  view.x=(view.x-cx)*factor+cx;
-  view.y=(view.y-cy)*factor+cy;
+  const oldScale=view.scale;
   view.scale=Math.max(0.12,Math.min(view.scale*factor,12));
+  const ef=view.scale/oldScale; // effective factor after clamping
+  view.x=(view.x-cx)*ef+cx;
+  view.y=(view.y-cy)*ef+cy;
   clampView();
 },{passive:false});
 
@@ -471,8 +473,10 @@ canvas.addEventListener('touchmove',e=>{
     const factor=dist/lastPinch;
     const cx=(e.touches[0].clientX+e.touches[1].clientX)/2;
     const cy=(e.touches[0].clientY+e.touches[1].clientY)/2;
-    view.x=(view.x-cx)*factor+cx;view.y=(view.y-cy)*factor+cy;
+    const oldScale=view.scale;
     view.scale=Math.max(0.12,Math.min(view.scale*factor,12));
+    const ef=view.scale/oldScale;
+    view.x=(view.x-cx)*ef+cx;view.y=(view.y-cy)*ef+cy;
     lastPinch=dist;clampView();
   }
   e.preventDefault();
