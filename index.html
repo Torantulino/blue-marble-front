@@ -355,15 +355,11 @@ function updateMinimap(){
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function render(){
-  canvas.width=window.innerWidth;
-  canvas.height=window.innerHeight;
   ctx.fillStyle='#000810';
   ctx.fillRect(0,0,canvas.width,canvas.height);
-  if(!earthImg)return;
+  if(!earthImg){requestAnimationFrame(render);return;}
   const{x,y,scale}=view;
   const dw=earthW*scale,dh=earthH*scale;
-  ctx.imageSmoothingEnabled=true;
-  ctx.imageSmoothingQuality='high';
   ctx.drawImage(earthImg,x,y,dw,dh);
   if(overlayCanvas&&gameStarted)ctx.drawImage(overlayCanvas,x,y,dw,dh);
   requestAnimationFrame(render);
@@ -581,11 +577,16 @@ document.getElementById('replayBtn').addEventListener('click',()=>{
 (async()=>{
   canvas.width=window.innerWidth;
   canvas.height=window.innerHeight;
-  window.addEventListener('resize',()=>{
+  ctx.imageSmoothingEnabled=true;
+  ctx.imageSmoothingQuality='high';
+  function resizeCanvas(){
     canvas.width=window.innerWidth;
     canvas.height=window.innerHeight;
+    ctx.imageSmoothingEnabled=true;
+    ctx.imageSmoothingQuality='high';
     if(earthImg)clampView();
-  });
+  }
+  window.addEventListener('resize',resizeCanvas);
   try{
     await loadNASAImages();
     setLoad(100,'Done!');
