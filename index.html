@@ -199,7 +199,7 @@ async function loadNASAImages(){
     // oceanmask: white(255)=ocean, black(0)=land
     const r=px[i*4],g=px[i*4+1],b=px[i*4+2];
     const bright=(r+g+b)/3;
-    landMask[i]=bright<128?1:0;
+    landMask[i]=bright>=128?1:0;
     if(landMask[i])land++;
   }
   totalLand=land;
