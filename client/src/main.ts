@@ -158,7 +158,7 @@ const lobbyScreen = document.getElementById('lobbyScreen') as HTMLDivElement;
 const hud = document.getElementById('hud') as HTMLDivElement;
 const bottomBar = document.getElementById('bottomBar') as HTMLDivElement;
 const gameOverScreen = document.getElementById('gameOver') as HTMLDivElement;
-const status = document.getElementById('status') as HTMLDivElement;
+const statusEl = document.getElementById('status') as HTMLDivElement;
 const chatPanel = document.getElementById('chatPanel') as HTMLDivElement;
 const chatMessages = document.getElementById('chatMessages') as HTMLDivElement;
 
@@ -235,7 +235,7 @@ function setupDbListeners() {
         endGame(newRow.winner === myPlayerId);
       }
       if (newRow.phase === 'Playing' && oldRow.phase === 'Spawn') {
-        status.textContent = 'Game started! Click enemy territory to attack.';
+        statusEl.textContent = 'Game started! Click enemy territory to attack.';
       }
     }
     updateMatchList();
@@ -264,7 +264,7 @@ function setupDbListeners() {
     if (Number(c.match_id) !== currentMatchId) return;
     const div = document.createElement('div');
     div.className = 'chat-msg';
-    const from = client.db.players.id().find(Number(c.from))?.name || '?';
+    const from = client.db.players.find(p => Number(p.id) === Number(c.from))?.name || '?';
     div.innerHTML = `<span class="chat-from">${escapeHtml(from)}:</span> ${escapeHtml(c.text)}`;
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -363,7 +363,7 @@ function updateHUD(p: any) {
   document.getElementById('hudPct')!.textContent = pct + '%';
   document.getElementById('hudTick')!.textContent = String(tickN);
   const alive = client.db.players.filter(p2 => Number(p2.match_id) === currentMatchId && p2.alive).length;
-  status.textContent = `Players alive: ${alive} | Your tiles: ${t.toLocaleString()} (${pct}%) | Gold: ${g.toLocaleString()}`;
+  statusEl.textContent = `Players alive: ${alive} | Your tiles: ${t.toLocaleString()} (${pct}%) | Gold: ${g.toLocaleString()}`;
 }
 
 // ── Minimap ────────────────────────────────────────────────────────────────────
@@ -475,23 +475,23 @@ canvas.addEventListener('click', e => {
   const tile = gy * SIM_W + gx;
 
   if (currentPhase === 'Spawn' && myPlayerId >= 0) {
-    const me = client.db.players.id().find(myPlayerId);
+    const me = client.db.players.find(p => Number(p.id) === myPlayerId);
     if (me && !me.spawn_tile) {
       client.reducers.call('spawn', [currentMatchId, tile]);
-      status.textContent = 'Spawn request sent…';
+      statusEl.textContent = 'Spawn request sent…';
     }
   } else if (currentPhase === 'Playing') {
     const owner = getOwnerFromChunks(gx, gy);
-    const me = client.db.players.id().find(myPlayerId);
+    const me = client.db.players.find(p => Number(p.id) === myPlayerId);
     if (!me || !me.alive) return;
     if (owner === null || owner === 255) {
-      status.textContent = '⚠️ That is ocean or unclaimed.';
+      statusEl.textContent = '⚠️ That is ocean or unclaimed.';
     } else if (owner === myPlayerId) {
-      status.textContent = 'Your territory. Use Build City to place a city here.';
+      statusEl.textContent = 'Your territory. Use Build City to place a city here.';
     } else {
       // Attack
       client.reducers.call('launch_attack', [currentMatchId, owner]);
-      status.textContent = 'Attack launched!';
+      statusEl.textContent = 'Attack launched!';
     }
   }
 });
@@ -567,11 +567,11 @@ document.getElementById('btnLeave')!.addEventListener('click', () => {
 document.getElementById('btnBuildCity')!.addEventListener('click', () => {
   if (currentPhase !== 'Playing' || myPlayerId < 0) return;
   // For simplicity, build city on a random owned tile
-  const me = client.db.players.id().find(myPlayerId);
+  const me = client.db.players.find(p => Number(p.id) === myPlayerId);
   if (!me || !me.spawn_tile) return;
   const tile = Number(me.spawn_tile);
   client.reducers.call('build_city', [currentMatchId, tile]);
-  status.textContent = 'City build request sent.';
+  statusEl.textContent = 'City build request sent.';
 });
 
 document.getElementById('btnRetreat')!.addEventListener('click', () => {
@@ -580,7 +580,7 @@ document.getElementById('btnRetreat')!.addEventListener('click', () => {
   for (const a of attacks) {
     client.reducers.call('retreat_attack', [currentMatchId, Number(a.target)]);
   }
-  status.textContent = 'Retreating all attacks.';
+  statusEl.textContent = 'Retreating all attacks.';
 });
 
 document.getElementById('btnChat')!.addEventListener('click', () => {
@@ -654,7 +654,7 @@ function endGame(won: boolean) {
   const statsEl = document.getElementById('goStats')!;
   title.textContent = won ? '🏆 Victory!' : '💀 Defeated';
   title.style.color = won ? '#4f8' : '#f44';
-  const me = client.db.players.id().find(myPlayerId);
+  const me = client.db.players.find(p => Number(p.id) === myPlayerId);
   const t = me ? Number(me.tiles) : 0;
   const pct = totalLand > 0 ? (t / totalLand * 100).toFixed(1) : '0.0';
   detail.textContent = won
