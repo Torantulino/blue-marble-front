@@ -33,7 +33,6 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
 .hud-bar{height:100%;border-radius:3px;background:linear-gradient(90deg,#0af,#06f);transition:width 0.4s;}
 #minimap-wrap{margin-left:auto;padding:0.3em 0.5em;display:flex;align-items:center;}
 #minimap{border:1px solid rgba(0,180,255,0.3);border-radius:3px;image-rendering:pixelated;}
-#tooltip{position:absolute;background:rgba(0,15,40,0.93);border:1px solid rgba(0,180,255,0.35);border-radius:8px;padding:0.5em 0.9em;font-size:0.82rem;color:#cef;pointer-events:none;display:none;max-width:200px;z-index:100;}
 #bottomBar{position:absolute;bottom:0;left:0;right:0;display:flex;align-items:center;gap:0.5em;padding:0.5em 1em;background:rgba(0,10,30,0.75);border-top:1px solid rgba(0,180,255,0.2);pointer-events:all;}
 #bottomBar.hidden{display:none;}
 #status{flex:1;font-size:0.82rem;color:#8cf;}
@@ -86,7 +85,6 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
         <b style="color:#4df;">🖱️ Click</b> any unclaimed land tile to spawn your nation<br>
         <b style="color:#4df;">🗺️ Pan</b> by dragging · <b style="color:#4df;">🔍 Zoom</b> with scroll wheel<br>
         <b style="color:#4df;">⚔️ Expand</b> automatically — troops grow and push outward<br>
-        <b style="color:#4df;">🏙️ Cities</b> appear as you grow, boosting troop capacity<br>
         <b style="color:#4df;">🎯 Win</b> by controlling 80% of all land tiles<br>
         <b style="color:#4df;">💀 Lose</b> if your last tile is captured<br>
         <b style="color:#4df;">⏩ Speed</b> buttons at bottom adjust simulation rate
@@ -100,7 +98,7 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
     <div class="hud-panel"><div class="hud-label">Troops</div><div class="hud-val" id="hudTroops">0</div><div class="hud-bar-wrap"><div class="hud-bar" id="hudTroopsBar" style="width:0%;background:linear-gradient(90deg,#4f8,#0a4)"></div></div></div>
     <div class="hud-panel"><div class="hud-label">Control</div><div class="hud-val" id="hudPct">0%</div></div>
     <div class="hud-panel"><div class="hud-label">Tick</div><div class="hud-val" id="hudTick">0</div></div>
-    <div id="minimap-wrap"><canvas id="minimap" width="216" height="108"></canvas></div>
+    <div id="minimap-wrap"><canvas id="minimap" width="270" height="135"></canvas></div>
   </div>
   <div id="bottomBar" class="hidden">
     <div id="status">Click a land tile to spawn…</div>
@@ -111,7 +109,6 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
       <button class="speed-btn" id="fastBtn">2×</button>
     </div>
   </div>
-  <div id="tooltip"></div>
   <div class="screen hidden" id="gameOver">
     <h2 id="goTitle">—</h2>
     <div class="result-detail" id="goDetail"></div>
@@ -122,20 +119,17 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
 <script>
 // ============================================================
 //  BLUE MARBLE FRONT — M0 Prototype
-//  NASA Blue Marble imagery · Canvas 2D · Zero dependencies
+//  NASA Blue Marble full-res render · Sim grid decoupled
 // ============================================================
 
 const NASA_URL = 'https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-base/may/world.200405.3x21600x10800.jpg';
-// We load a downscaled version for performance — sample to our grid size
+
+// Simulation grid (decoupled from render resolution)
+const SIM_W = 1080, SIM_H = 540;
+
 const CFG = {
-  GW: 540, GH: 270,
-  PLAYER_COLOR: '#00ccff',
-  WIN_PCT: 0.80,
-  AI_COUNT: 12,
-  TICK_MS: 100,
-  TROOP_REGEN_BASE: 10,
-  MAX_TROOP_SCALE: 2,
-  EXPAND_INTERVAL: 3,
+  WIN_PCT: 0.80, AI_COUNT: 12, TICK_MS: 100,
+  TROOP_REGEN_BASE: 10, MAX_TROOP_SCALE: 2, EXPAND_INTERVAL: 3,
 };
 
 const PLAYER_COLORS = [
@@ -143,104 +137,94 @@ const PLAYER_COLORS = [
   '#ff8800','#00ffee','#aa44ff','#ff6688','#66ff44',
   '#ffaa44','#44aaff','#ff2299',
 ];
-
 const NATION_NAMES = [
   'Valdoria','Crimson Empire','Verdania','Aurelia','Noctara',
   'Inferna','Thalassion','Umbral League','Roseveil','Fernwood',
   'Solareth','Azurion','Magentara',
 ];
 
-// ── STATE ───────────────────────────────────────────────────
+// ── STATE ────────────────────────────────────────────────────
 let state = {
   phase:'loading', tick:0, speed:1, difficulty:'normal',
   landMask:null, owners:null, troops:null, tiles:null,
   maxTroops:null, colors:null, names:null, alive:null,
-  playerIdx:0, totalLand:0, tickTimer:null, playerSpawned:false,
-  expandQueue:[], GW:CFG.GW, GH:CFG.GH, diffMod:1,
-  earthPixels:null, // Uint8ClampedArray from NASA image
+  totalLand:0, tickTimer:null, playerSpawned:false,
+  expandQueue:[], diffMod:1,
 };
+
+// ── CANVASES ─────────────────────────────────────────────────
+// earthImg: the raw NASA Image element (full res, drawn by browser natively)
+// overlayCanvas: SIM_W×SIM_H ownership colour layer (upscaled by browser)
+let earthImg = null;       // HTMLImageElement — full NASA resolution
+let earthW = 0, earthH = 0; // actual pixel dimensions of loaded image
+let overlayCanvas = null;
+let overlayDirty = true;
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
-let earthCanvas = null; // full-res terrain from NASA
-let overlay = null;
-let mmCanvas = document.getElementById('minimap');
-let mmCtx = mmCanvas.getContext('2d');
-let view = {x:0,y:0,scale:2,minScale:0.5,maxScale:16};
+const mmCanvas = document.getElementById('minimap');
+const mmCtx = mmCanvas.getContext('2d');
+
+let view = {x:0,y:0,scale:2,minScale:0.3,maxScale:24};
 let drag = {active:false,sx:0,sy:0,svx:0,svy:0,moved:false};
 
-function resize(){
-  canvas.width=window.innerWidth; canvas.height=window.innerHeight;
-}
+function resize(){ canvas.width=window.innerWidth; canvas.height=window.innerHeight; }
 window.addEventListener('resize',resize);
 resize();
 
 // ── LOAD NASA IMAGE ─────────────────────────────────────────
 function loadNASAImage(){
-  const el=document.getElementById('loadBar');
+  const bar=document.getElementById('loadBar');
   const msg=document.getElementById('loadMsg');
-  el.style.width='10%';
+  bar.style.width='10%';
+  msg.textContent='Downloading NASA Blue Marble (21600×10800)…';
 
   const img = new Image();
   img.crossOrigin = 'anonymous';
 
   img.onload = function(){
-    msg.textContent='Processing satellite imagery…';
-    el.style.width='60%';
-    // Draw to offscreen canvas at grid resolution
+    earthImg = img;
+    earthW = img.naturalWidth;
+    earthH = img.naturalHeight;
+    msg.textContent='Processing land mask…';
+    bar.style.width='60%';
+
+    // Sample the image at sim resolution to build land mask
     const tmp = document.createElement('canvas');
-    tmp.width=CFG.GW; tmp.height=CFG.GH;
+    tmp.width=SIM_W; tmp.height=SIM_H;
     const tc = tmp.getContext('2d');
-    tc.drawImage(img, 0, 0, CFG.GW, CFG.GH);
-    const imgData = tc.getImageData(0,0,CFG.GW,CFG.GH);
-    state.earthPixels = imgData.data;
+    tc.drawImage(img, 0, 0, SIM_W, SIM_H);
+    const imgData = tc.getImageData(0,0,SIM_W,SIM_H);
+    const d = imgData.data;
 
-    el.style.width='80%';
-    msg.textContent='Generating land mask…';
-
-    // Derive land mask from pixel data
-    // Ocean pixels are mostly blue (b > r && b > g)
-    // Land pixels have higher red/green relative to blue
-    state.landMask = new Uint8Array(CFG.GW*CFG.GH);
-    const d = state.earthPixels;
-    for(let i=0;i<CFG.GW*CFG.GH;i++){
+    state.landMask = new Uint8Array(SIM_W*SIM_H);
+    for(let i=0;i<SIM_W*SIM_H;i++){
       const idx=i*4;
       const r=d[idx], g=d[idx+1], b=d[idx+2];
-      // Heuristic: land if not predominantly blue
-      // Ocean: b > r+15 && b > g+5 && brightness < 200
-      // Also catch ice: very bright (>210 all channels) at high lat → land
-      const brightness = (r+g+b)/3;
-      const y = Math.floor(i/CFG.GW);
-      const lat = Math.abs(90 - y*(180/CFG.GH));
-      const isOcean = (b > r+12 && b > g+5 && brightness < 180);
-      const isDeepOcean = (b > 80 && r < 60 && g < 80);
-      const isIce = brightness > 195 && lat > 55;
-      state.landMask[i] = (isOcean || isDeepOcean) && !isIce ? 0 : 1;
+      const brightness=(r+g+b)/3;
+      const y=Math.floor(i/SIM_W);
+      const lat=Math.abs(90-y*(180/SIM_H));
+      const isOcean=(b>r+12 && b>g+5 && brightness<180);
+      const isDeepOcean=(b>80 && r<60 && g<80);
+      const isIce=brightness>195 && lat>55;
+      state.landMask[i]=(isOcean||isDeepOcean)&&!isIce ? 0 : 1;
     }
-
-    // Smooth pass to clean noise
-    const tmp2 = new Uint8Array(state.landMask);
-    for(let y=1;y<CFG.GH-1;y++){
-      for(let x=1;x<CFG.GW-1;x++){
+    // Smooth
+    const m2=new Uint8Array(state.landMask);
+    for(let y=1;y<SIM_H-1;y++){
+      for(let x=1;x<SIM_W-1;x++){
         let s=0;
         for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++)
-          s+=tmp2[((y+dy)*CFG.GW+(x+dx+CFG.GW)%CFG.GW)];
-        state.landMask[y*CFG.GW+x]=s>=5?1:s<=3?0:tmp2[y*CFG.GW+x];
+          s+=m2[(y+dy)*SIM_W+((x+dx+SIM_W)%SIM_W)];
+        state.landMask[y*SIM_W+x]=s>=5?1:s<=3?0:m2[y*SIM_W+x];
       }
     }
+    state.totalLand=state.landMask.reduce((a,b)=>a+b,0);
 
-    el.style.width='95%';
-    msg.textContent='Building Earth canvas…';
+    // Store minimap pixel data from the sampled image
+    state.mmPixels = d;
 
-    // Build the earth display canvas (NASA imagery)
-    earthCanvas = document.createElement('canvas');
-    earthCanvas.width=CFG.GW; earthCanvas.height=CFG.GH;
-    const ec = earthCanvas.getContext('2d');
-    ec.putImageData(imgData,0,0);
-
-    state.totalLand = state.landMask.reduce((a,b)=>a+b,0);
-
-    el.style.width='100%';
+    bar.style.width='100%';
     msg.textContent='Ready!';
     setTimeout(()=>{
       document.getElementById('loading').style.display='none';
@@ -250,124 +234,131 @@ function loadNASAImage(){
   };
 
   img.onerror = function(){
-    msg.textContent='Loading from proxy…';
-    // Try a CORS proxy fallback
-    img.crossOrigin='anonymous';
-    img.src='https://corsproxy.io/?'+encodeURIComponent(NASA_URL);
-    img.onerror = function(){
-      msg.textContent='Direct load failed — trying alternate…';
-      // Final fallback: use a smaller NASA image
-      img.src='https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_2048.jpg';
-      img.onerror = function(){
-        msg.textContent='Could not load imagery. Using procedural map.';
-        generateFallbackEarth();
-      };
+    msg.textContent='Trying CORS proxy…';
+    const img2=new Image(); img2.crossOrigin='anonymous';
+    img2.onload=img.onload.bind(img2);
+    img2.onerror=function(){
+      msg.textContent='Trying alternate source…';
+      const img3=new Image(); img3.crossOrigin='anonymous';
+      img3.onload=img.onload.bind(img3);
+      img3.onerror=function(){ msg.textContent='Image failed. Using fallback.'; generateFallback(); };
+      img3.src='https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_2048.jpg';
     };
+    img2.src='https://corsproxy.io/?'+encodeURIComponent(NASA_URL);
   };
 
-  msg.textContent='Downloading NASA Blue Marble (21600×10800)…';
   img.src = NASA_URL;
 }
 
-// Fallback procedural earth if image fails
-function generateFallbackEarth(){
-  const W=CFG.GW, H=CFG.GH;
-  state.landMask = new Uint8Array(W*H);
-  const rng = (function(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}})(0xBEEF1234);
-  const continents=[[-168,-52,25,72,0.82],[-73,-12,60,84,0.78],[-81,-34,-56,13,0.88],[-12,40,36,71,0.80],[-18,52,-35,37,0.90],[26,90,10,72,0.88],[90,145,10,72,0.85],[95,141,-10,20,0.50],[114,154,-44,-9,0.85],[166,178,-47,-34,0.75],[130,146,31,46,0.70],[-11,2,50,60,0.72],[-25,-9,63,66,0.68],[-180,180,-90,-62,0.90],[-168,-130,54,72,0.75],[-92,-77,7,18,0.60],[4,31,55,71,0.78],[68,88,8,35,0.90],[44,50,-26,-12,0.75]];
-  for(let y=0;y<H;y++){const lat=90-(y+.5)*(180/H);for(let x=0;x<W;x++){const lon=-180+(x+.5)*(360/W);let land=false;for(const[lo,hi,la,lb,dens]of continents){if(lon>=lo&&lon<=hi&&lat>=la&&lat<=lb&&rng()<dens){land=true;break;}}state.landMask[y*W+x]=land?1:0;}}
-  const tmp=new Uint8Array(state.landMask);
-  for(let y=1;y<H-1;y++)for(let x=1;x<W-1;x++){let s=0;for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++)s+=tmp[(y+dy)*W+(x+dx+W)%W];state.landMask[y*W+x]=s>=5?1:s<=3?0:tmp[y*W+x];}
-
-  earthCanvas=document.createElement('canvas');earthCanvas.width=W;earthCanvas.height=H;
-  const ec=earthCanvas.getContext('2d');const img=ec.createImageData(W,H);const d=img.data;
-  for(let i=0;i<W*H;i++){const idx=i*4;const land=state.landMask[i];const y2=Math.floor(i/W);const lat=Math.abs(90-y2*(180/H));
-    if(land){if(lat>60){d[idx]=200;d[idx+1]=220;d[idx+2]=230;}else if(lat>45){d[idx]=100;d[idx+1]=130;d[idx+2]=80;}else if(lat>25){d[idx]=120;d[idx+1]=150;d[idx+2]=60;}else{d[idx]=80;d[idx+1]=140;d[idx+2]=40;}d[idx+3]=255;}
-    else{const b2=Math.floor(30+50*(y2/H));d[idx]=5;d[idx+1]=20+Math.floor(30*(y2/H));d[idx+2]=b2+60;d[idx+3]=255;}}
-  ec.putImageData(img,0,0);
+function generateFallback(){
+  // Procedural fallback — creates a canvas as earthImg substitute
+  const W=SIM_W,H=SIM_H;
+  state.landMask=new Uint8Array(W*H);
+  const rng=(function(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}})(0xBEEF1234);
+  const C=[[-168,-52,25,72,.82],[-73,-12,60,84,.78],[-81,-34,-56,13,.88],[-12,40,36,71,.80],[-18,52,-35,37,.90],[26,90,10,72,.88],[90,145,10,72,.85],[95,141,-10,20,.50],[114,154,-44,-9,.85],[166,178,-47,-34,.75],[130,146,31,46,.70],[-11,2,50,60,.72],[-25,-9,63,66,.68],[-180,180,-90,-62,.90],[-168,-130,54,72,.75],[-92,-77,7,18,.60],[4,31,55,71,.78],[68,88,8,35,.90],[44,50,-26,-12,.75]];
+  for(let y=0;y<H;y++){const lat=90-(y+.5)*(180/H);for(let x=0;x<W;x++){const lon=-180+(x+.5)*(360/W);let land=false;for(const[lo,hi,la,lb,dens]of C){if(lon>=lo&&lon<=hi&&lat>=la&&lat<=lb&&rng()<dens){land=true;break;}}state.landMask[y*W+x]=land?1:0;}}
+  const cv=document.createElement('canvas');cv.width=W;cv.height=H;
+  const ec=cv.getContext('2d');const id=ec.createImageData(W,H);const dd=id.data;
+  for(let i=0;i<W*H;i++){const idx=i*4;const y2=Math.floor(i/W);const lat=Math.abs(90-y2*(180/H));
+    if(state.landMask[i]){if(lat>60){dd[idx]=200;dd[idx+1]=220;dd[idx+2]=230;}else if(lat>45){dd[idx]=100;dd[idx+1]=130;dd[idx+2]=80;}else{dd[idx]=80;dd[idx+1]=140;dd[idx+2]=40;}dd[idx+3]=255;}
+    else{dd[idx]=5;dd[idx+1]=20+Math.floor(30*(y2/H));dd[idx+2]=60+Math.floor(50*(y2/H));dd[idx+3]=255;}}
+  ec.putImageData(id,0,0);
+  earthImg=cv; earthW=W; earthH=H;
   state.totalLand=state.landMask.reduce((a,b)=>a+b,0);
+  state.mmPixels=dd;
   document.getElementById('loading').style.display='none';
   document.getElementById('startScreen').classList.remove('hidden');
   state.phase='start';
 }
 
-// ── OVERLAY (ownership colours) ──────────────────────────────
+// ── OVERLAY ──────────────────────────────────────────────────
+const _hc={};
+function hex2rgb(h){if(_hc[h])return _hc[h];return _hc[h]={r:parseInt(h.slice(1,3),16),g:parseInt(h.slice(3,5),16),b:parseInt(h.slice(5,7),16)};}
+
 function buildOverlay(){
-  overlay=document.createElement('canvas');
-  overlay.width=CFG.GW;overlay.height=CFG.GH;
+  overlayCanvas=document.createElement('canvas');
+  overlayCanvas.width=SIM_W; overlayCanvas.height=SIM_H;
 }
 
-const _hexCache={};
-function hexToRgb(hex){if(_hexCache[hex])return _hexCache[hex];const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);return _hexCache[hex]={r,g,b};}
-
 function updateOverlay(){
-  if(!overlay)return;
-  const{GW,GH,owners,colors,alive}=state;
-  const oc=overlay.getContext('2d');
-  const img=oc.createImageData(GW,GH);
+  if(!overlayCanvas)return;
+  const oc=overlayCanvas.getContext('2d');
+  const img=oc.createImageData(SIM_W,SIM_H);
   const d=img.data;
-  for(let i=0;i<GW*GH;i++){
-    const o=owners[i];if(o<0)continue;
-    const c=hexToRgb(colors[o]);
+  const{owners,colors,alive}=state;
+  for(let i=0;i<SIM_W*SIM_H;i++){
+    const o=owners[i]; if(o<0)continue;
+    const c=hex2rgb(colors[o]);
     const idx=i*4;
-    d[idx]=c.r;d[idx+1]=c.g;d[idx+2]=c.b;d[idx+3]=alive[o]?170:60;
+    d[idx]=c.r;d[idx+1]=c.g;d[idx+2]=c.b;d[idx+3]=alive[o]?160:50;
   }
   oc.putImageData(img,0,0);
+  overlayDirty=false;
 }
 
 // ── RENDER ───────────────────────────────────────────────────
-function renderTerrain(){
-  if(!earthCanvas)return;
+// Key insight: earthImg is drawn at its NATIVE resolution by the browser.
+// The browser's bicubic scaling makes NASA imagery sharp at all zoom levels.
+// The overlay is at SIM_W×SIM_H but gets smoothly upscaled on top.
+
+function render(){
+  if(!earthImg)return;
   ctx.clearRect(0,0,canvas.width,canvas.height);
-  // Dark space background
   ctx.fillStyle='#000810';
   ctx.fillRect(0,0,canvas.width,canvas.height);
-  const{x,y,scale}=view;
-  const dw=state.GW*scale,dh=state.GH*scale;
-  ctx.imageSmoothingEnabled=scale<4;
-  ctx.drawImage(earthCanvas,x,y,dw,dh);
-  if(overlay)ctx.drawImage(overlay,x,y,dw,dh);
+
+  const {x,y,scale}=view;
+  // Draw earth at full native resolution, scaled by view
+  // We use earthW/earthH as the logical world size for positioning
+  const dw=earthW*scale, dh=earthH*scale;
+  ctx.imageSmoothingEnabled=true;
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(earthImg, x, y, dw, dh);
+
+  // Draw ownership overlay — scaled from SIM grid to match earth
+  if(overlayCanvas){
+    ctx.drawImage(overlayCanvas, x, y, dw, dh);
+  }
 }
 
 function renderMinimap(){
-  const{GW,GH,owners,colors,alive,landMask,earthPixels}=state;
+  const{owners,colors,alive}=state;
   if(!owners)return;
-  const mw=mmCanvas.width,mh=mmCanvas.height;
+  const mw=mmCanvas.width, mh=mmCanvas.height;
   const img=mmCtx.createImageData(mw,mh);
   const d=img.data;
-  const sx=GW/mw,sy=GH/mh;
+  const sx=SIM_W/mw, sy=SIM_H/mh;
+  const mp=state.mmPixels;
   for(let py=0;py<mh;py++){
     for(let px=0;px<mw;px++){
-      const gx=Math.floor(px*sx),gy=Math.floor(py*sy);
-      const gi=gy*GW+gx;
+      const gx=Math.floor(px*sx), gy=Math.floor(py*sy);
+      const gi=gy*SIM_W+gx;
       const o=owners[gi];
       const idx=(py*mw+px)*4;
       if(o>=0){
-        const c=hexToRgb(colors[o]);
+        const c=hex2rgb(colors[o]);
         d[idx]=c.r;d[idx+1]=c.g;d[idx+2]=c.b;d[idx+3]=200;
-      } else if(earthPixels){
+      } else if(mp){
         const si=gi*4;
-        d[idx]=earthPixels[si];d[idx+1]=earthPixels[si+1];d[idx+2]=earthPixels[si+2];d[idx+3]=255;
-      } else if(landMask[gi]){
-        d[idx]=90;d[idx+1]=110;d[idx+2]=70;d[idx+3]=255;
+        d[idx]=mp[si];d[idx+1]=mp[si+1];d[idx+2]=mp[si+2];d[idx+3]=255;
       } else {
         d[idx]=5;d[idx+1]=25;d[idx+2]=70;d[idx+3]=255;
       }
     }
   }
   mmCtx.putImageData(img,0,0);
-  const vx=(-view.x/view.scale/state.GW)*mw;
-  const vy=(-view.y/view.scale/state.GH)*mh;
-  const vw=(canvas.width/view.scale/state.GW)*mw;
-  const vh=(canvas.height/view.scale/state.GH)*mh;
+  // Viewport rect
+  const vx=(-view.x/view.scale/earthW)*mw;
+  const vy=(-view.y/view.scale/earthH)*mh;
+  const vw=(canvas.width/view.scale/earthW)*mw;
+  const vh=(canvas.height/view.scale/earthH)*mh;
   mmCtx.strokeStyle='rgba(255,255,255,0.6)';mmCtx.lineWidth=1;
   mmCtx.strokeRect(vx,vy,vw,vh);
 }
 
 // ── GAME INIT ────────────────────────────────────────────────
 function initGame(){
-  const{GW,GH}=state;
-  state.owners=new Int16Array(GW*GH).fill(-1);
+  state.owners=new Int16Array(SIM_W*SIM_H).fill(-1);
   const N=CFG.AI_COUNT+1;
   state.troops=new Float32Array(N);
   state.tiles=new Int32Array(N);
@@ -380,39 +371,30 @@ function initGame(){
   state.diffMod=state.difficulty==='easy'?0.6:state.difficulty==='hard'?1.5:1.0;
   buildOverlay();
 
-  // Spawn AI nations on random land tiles spread across the map
+  // Spawn AIs spread across the map
   const rng=(function(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}})(Date.now()|0);
   for(let p=1;p<N;p++){
-    let attempts=0;
-    while(attempts<5000){
-      const tx=Math.floor(rng()*GW),ty=Math.floor(rng()*GH);
-      const ti=ty*GW+tx;
-      if(state.landMask[ti]&&state.owners[ti]<0){
-        // Check distance from other spawns
-        let tooClose=false;
-        for(let q=1;q<p;q++){
-          if(state.tiles[q]===0)continue;
-          // Find a tile owned by q
-          for(let si=0;si<GW*GH;si++){
-            if(state.owners[si]===q){
-              const sx2=si%GW,sy2=Math.floor(si/GW);
-              const dx=Math.min(Math.abs(tx-sx2),GW-Math.abs(tx-sx2));
-              const dy=Math.abs(ty-sy2);
-              if(Math.sqrt(dx*dx+dy*dy)<30){tooClose=true;}
-              break;
-            }
+    let placed=false;
+    for(let a=0;a<5000&&!placed;a++){
+      const tx=Math.floor(rng()*SIM_W),ty=Math.floor(rng()*SIM_H);
+      if(!state.landMask[ty*SIM_W+tx]||state.owners[ty*SIM_W+tx]>=0)continue;
+      let ok=true;
+      for(let q=1;q<p&&ok;q++){
+        if(state.tiles[q]===0)continue;
+        for(let si=0;si<SIM_W*SIM_H;si++){
+          if(state.owners[si]===q){
+            const dx=Math.min(Math.abs(tx-si%SIM_W),SIM_W-Math.abs(tx-si%SIM_W));
+            const dy=Math.abs(ty-Math.floor(si/SIM_W));
+            if(Math.sqrt(dx*dx+dy*dy)<50){ok=false;}break;
           }
-          if(tooClose)break;
         }
-        if(!tooClose){spawnPlayer(p,tx,ty);break;}
       }
-      attempts++;
+      if(ok){spawnPlayer(p,tx,ty);placed=true;}
     }
-    // If couldn't find distant spot, just place anywhere
-    if(state.tiles[p]===0){
-      for(let a=0;a<2000;a++){
-        const tx=Math.floor(rng()*GW),ty=Math.floor(rng()*GH);
-        if(state.landMask[ty*GW+tx]&&state.owners[ty*GW+tx]<0){spawnPlayer(p,tx,ty);break;}
+    if(!placed){
+      for(let a=0;a<3000;a++){
+        const tx=Math.floor(rng()*SIM_W),ty=Math.floor(rng()*SIM_H);
+        if(state.landMask[ty*SIM_W+tx]&&state.owners[ty*SIM_W+tx]<0){spawnPlayer(p,tx,ty);break;}
       }
     }
   }
@@ -421,90 +403,71 @@ function initGame(){
 }
 
 function spawnPlayer(p,tx,ty){
-  const{GW}=state;
-  const ti=ty*GW+tx;
-  state.owners[ti]=p;state.tiles[p]++;
-  state.troops[p]=50;state.maxTroops[p]=calcMaxTroops(p);
+  state.owners[ty*SIM_W+tx]=p; state.tiles[p]++;
+  state.troops[p]=50; state.maxTroops[p]=calcMaxTroops(p);
   addFrontier(p,tx,ty);
 }
 
 function addFrontier(p,tx,ty){
-  const{GW,GH}=state;
   const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
   for(const[dx,dy]of dirs){
-    const nx=(tx+dx+GW)%GW,ny=ty+dy;
-    if(ny<0||ny>=GH)continue;
-    const ni=ny*GW+nx;
-    if(state.landMask[ni]&&state.owners[ni]!==p){
+    const nx=(tx+dx+SIM_W)%SIM_W, ny=ty+dy;
+    if(ny<0||ny>=SIM_H)continue;
+    if(state.landMask[ny*SIM_W+nx]&&state.owners[ny*SIM_W+nx]!==p){
       state.expandQueue[p].push([nx,ny]);
     }
   }
 }
 
 function centerView(){
-  const s=Math.min(canvas.width/state.GW,canvas.height/state.GH)*0.9;
+  const s=Math.min(canvas.width/earthW, canvas.height/earthH)*0.95;
   view.scale=Math.max(view.minScale,Math.min(view.maxScale,s));
-  view.x=(canvas.width-state.GW*view.scale)/2;
-  view.y=(canvas.height-state.GH*view.scale)/2;
+  view.x=(canvas.width-earthW*view.scale)/2;
+  view.y=(canvas.height-earthH*view.scale)/2;
 }
 
-function calcMaxTroops(p){const t=state.tiles[p];return CFG.MAX_TROOP_SCALE*(Math.pow(t,0.6)*1000+50000);}
+function calcMaxTroops(p){return CFG.MAX_TROOP_SCALE*(Math.pow(state.tiles[p],0.6)*1000+50000);}
 function troopRegen(p){return CFG.TROOP_REGEN_BASE+Math.pow(state.troops[p],0.73)/4;}
 
 // ── TICK ─────────────────────────────────────────────────────
 function gameTick(){
   if(state.phase!=='play')return;
   state.tick++;
-  const{GW,GH,owners,tiles,troops,maxTroops,alive,landMask,expandQueue,diffMod}=state;
+  const{owners,tiles,troops,maxTroops,alive,landMask,expandQueue,diffMod}=state;
   const N=CFG.AI_COUNT+1;
 
-  // Regen troops
   for(let p=0;p<N;p++){
     if(!alive[p]||tiles[p]===0)continue;
     maxTroops[p]=calcMaxTroops(p);
-    const regen=troopRegen(p)*(p===0?1:diffMod);
-    troops[p]=Math.min(maxTroops[p],troops[p]+regen);
+    troops[p]=Math.min(maxTroops[p],troops[p]+troopRegen(p)*(p===0?1:diffMod));
   }
 
-  // Expand
   if(state.tick%CFG.EXPAND_INTERVAL===0){
     for(let p=0;p<N;p++){
-      if(!alive[p]||tiles[p]===0)continue;
-      if(troops[p]<20)continue;
-      const q=expandQueue[p];
-      if(q.length===0)continue;
-      const attackPower=Math.max(1,Math.floor(tiles[p]*0.02+troops[p]/500));
-      const tries=Math.min(attackPower,q.length,p===0?attackPower:Math.ceil(attackPower*diffMod));
+      if(!alive[p]||tiles[p]===0||troops[p]<20)continue;
+      const q=expandQueue[p]; if(q.length===0)continue;
+      const power=Math.max(1,Math.floor(tiles[p]*0.02+troops[p]/500));
+      const tries=Math.min(power,q.length,p===0?power:Math.ceil(power*diffMod));
       for(let t=0;t<tries;t++){
         if(q.length===0)break;
         const idx=Math.floor(Math.random()*q.length);
-        const[nx,ny]=q[idx];
-        q.splice(idx,1);
-        const ni=ny*GW+nx;
+        const[nx,ny]=q[idx]; q.splice(idx,1);
+        const ni=ny*SIM_W+nx;
         if(!landMask[ni])continue;
-        const defender=owners[ni];
-        if(defender===p)continue;
-        const defTroops=defender<0?0:troops[defender];
-        const atkStr=troops[p];
-        const defStr=defTroops*0.3;
-        if(atkStr>defStr+10){
-          if(defender>=0){
-            tiles[defender]--;
-            troops[defender]=Math.max(0,troops[defender]-defStr*0.3);
-            if(tiles[defender]<=0){alive[defender]=false;troops[defender]=0;}
-            // Add recaptured frontier for defender's neighbors
+        const def=owners[ni]; if(def===p)continue;
+        const defStr=def<0?0:troops[def]*0.3;
+        if(troops[p]>defStr+10){
+          if(def>=0){
+            tiles[def]--;troops[def]=Math.max(0,troops[def]-defStr*0.3);
+            if(tiles[def]<=0){alive[def]=false;troops[def]=0;}
           }
           troops[p]=Math.max(0,troops[p]-Math.max(1,defStr*0.1));
-          owners[ni]=p;tiles[p]++;
-          addFrontier(p,nx,ny);
-        } else {
-          q.push([nx,ny]);
-        }
+          owners[ni]=p;tiles[p]++;addFrontier(p,nx,ny);
+        } else { q.push([nx,ny]); }
       }
     }
   }
 
-  // Shuffle AI queues for variety
   if(state.tick%20===0){
     for(let p=1;p<N;p++){
       const q=expandQueue[p];
@@ -512,14 +475,12 @@ function gameTick(){
     }
   }
 
-  // Check win/lose
   if(state.playerSpawned){
-    const pct=tiles[0]/state.totalLand;
-    if(pct>=CFG.WIN_PCT){endGame(true);return;}
+    if(tiles[0]/state.totalLand>=CFG.WIN_PCT){endGame(true);return;}
     if(!alive[0]||tiles[0]===0){endGame(false);return;}
   }
 
-  if(state.tick%3===0)updateOverlay();
+  if(state.tick%3===0){updateOverlay();overlayDirty=true;}
   updateHUD();
 }
 
@@ -538,32 +499,29 @@ function updateHUD(){
   document.getElementById('hudTick').textContent=state.tick;
   let msg='';
   if(!state.playerSpawned)msg='Click any land tile to spawn your nation!';
-  else if(t<10)msg='Grow your territory — expand aggressively!';
-  else if(t/totalLand<0.1)msg='Keep expanding — '+(CFG.WIN_PCT*100)+'% land needed to win!';
+  else if(t<10)msg='Grow your territory!';
+  else if(t/totalLand<0.1)msg='Keep expanding — '+CFG.WIN_PCT*100+'% to win!';
   else msg='Controlling '+pct+'% · '+(CFG.WIN_PCT*100-parseFloat(pct)).toFixed(1)+'% more to win';
   document.getElementById('status').textContent=msg;
 }
 
-// ── END GAME ─────────────────────────────────────────────────
 function endGame(won){
   state.phase='over';clearInterval(state.tickTimer);
-  const{tiles,totalLand,tick}=state;
-  const pct=(tiles[0]/totalLand*100).toFixed(1);
-  const survivors=state.alive.filter(Boolean).length-1;
+  const pct=(state.tiles[0]/state.totalLand*100).toFixed(1);
+  const surv=state.alive.filter(Boolean).length-1;
   document.getElementById('goTitle').textContent=won?'🏆 VICTORY!':'💀 DEFEATED';
   document.getElementById('goTitle').style.color=won?'#4f8':'#f44';
   document.getElementById('goDetail').textContent=won
-    ?'You conquered '+pct+'% of Earth and achieved global dominance!'
-    :'Your nation fell after '+tick+' ticks. '+survivors+' rivals remain.';
+    ?'You conquered '+pct+'% of Earth!'
+    :'Your nation fell after '+state.tick+' ticks. '+surv+' rivals remain.';
   document.getElementById('goStats').innerHTML=
-    "<div class='stat-item'><div class='label'>Tiles Held</div><div class='val'>"+tiles[0].toLocaleString()+"</div></div>"+
+    "<div class='stat-item'><div class='label'>Tiles</div><div class='val'>"+state.tiles[0].toLocaleString()+"</div></div>"+
     "<div class='stat-item'><div class='label'>Control</div><div class='val'>"+pct+"%</div></div>"+
-    "<div class='stat-item'><div class='label'>Ticks Survived</div><div class='val'>"+tick+"</div></div>"+
-    "<div class='stat-item'><div class='label'>AI Rivals Left</div><div class='val'>"+survivors+"</div></div>";
+    "<div class='stat-item'><div class='label'>Ticks</div><div class='val'>"+state.tick+"</div></div>"+
+    "<div class='stat-item'><div class='label'>Rivals Left</div><div class='val'>"+surv+"</div></div>";
   document.getElementById('gameOver').classList.remove('hidden');
 }
 
-// ── START / RESET ────────────────────────────────────────────
 function startGame(){
   document.getElementById('startScreen').classList.add('hidden');
   document.getElementById('hud').classList.remove('hidden');
@@ -579,13 +537,13 @@ function resetGame(){
   document.getElementById('hud').classList.add('hidden');
   document.getElementById('bottomBar').classList.add('hidden');
   document.getElementById('startScreen').classList.remove('hidden');
-  state.phase='start';state.playerSpawned=false;overlay=null;
+  state.phase='start';state.playerSpawned=false;overlayCanvas=null;
 }
 
 let rafId=null;
-function renderLoop(){rafId=requestAnimationFrame(renderLoop);renderTerrain();if(state.tick%5===0)renderMinimap();}
+function renderLoop(){rafId=requestAnimationFrame(renderLoop);render();if(state.tick%5===0)renderMinimap();}
 
-// ── INPUT — PAN & ZOOM ──────────────────────────────────────
+// ── INPUT ────────────────────────────────────────────────────
 canvas.addEventListener('mousedown',e=>{
   drag.active=true;drag.sx=e.clientX;drag.sy=e.clientY;
   drag.svx=view.x;drag.svy=view.y;drag.moved=false;
@@ -607,7 +565,8 @@ canvas.addEventListener('touchstart',e=>{
     drag.sx=e.touches[0].clientX;drag.sy=e.touches[0].clientY;
     drag.svx=view.x;drag.svy=view.y;
   } else if(e.touches.length===2){
-    lastTouchDist=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+    lastTouchDist=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+      e.touches[0].clientY-e.touches[1].clientY);
   }
 },{passive:false});
 canvas.addEventListener('touchmove',e=>{
@@ -617,35 +576,39 @@ canvas.addEventListener('touchmove',e=>{
     if(Math.abs(dx)>5||Math.abs(dy)>5)drag.moved=true;
     view.x=drag.svx+dx;view.y=drag.svy+dy;
   } else if(e.touches.length===2){
-    const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
-    const ratio=d/lastTouchDist;
+    const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+      e.touches[0].clientY-e.touches[1].clientY);
     const mx=(e.touches[0].clientX+e.touches[1].clientX)/2;
     const my=(e.touches[0].clientY+e.touches[1].clientY)/2;
-    zoomAt(mx,my,ratio);lastTouchDist=d;
+    zoomAt(mx,my,d/lastTouchDist);lastTouchDist=d;
   }
 },{passive:false});
 canvas.addEventListener('touchend',e=>{
-  if(e.changedTouches.length===1&&!drag.moved){handleClick(e.changedTouches[0].clientX,e.changedTouches[0].clientY);}
+  if(e.changedTouches.length===1&&!drag.moved)
+    handleClick(e.changedTouches[0].clientX,e.changedTouches[0].clientY);
   drag.active=false;
 },{passive:false});
-
 canvas.addEventListener('wheel',e=>{
-  e.preventDefault();
-  zoomAt(e.clientX,e.clientY,e.deltaY<0?1.12:0.89);
+  e.preventDefault();zoomAt(e.clientX,e.clientY,e.deltaY<0?1.12:0.89);
 },{passive:false});
 
 function zoomAt(cx,cy,factor){
   const ns=Math.max(view.minScale,Math.min(view.maxScale,view.scale*factor));
-  const ratio=ns/view.scale;
-  view.x=cx-(cx-view.x)*ratio;view.y=cy-(cy-view.y)*ratio;view.scale=ns;
+  const r=ns/view.scale;
+  view.x=cx-(cx-view.x)*r;view.y=cy-(cy-view.y)*r;view.scale=ns;
 }
 
 function handleClick(cx,cy){
   if(state.phase!=='play')return;
-  const gx=Math.floor((cx-view.x)/view.scale);
-  const gy=Math.floor((cy-view.y)/view.scale);
-  if(gx<0||gx>=state.GW||gy<0||gy>=state.GH)return;
-  const gi=gy*state.GW+gx;
+  // Convert screen coords → sim grid coords
+  // earthImg is drawn at (view.x, view.y) with size earthW*scale × earthH*scale
+  // sim grid maps to the same rect: SIM_W covers earthW, SIM_H covers earthH
+  const worldX=(cx-view.x)/view.scale; // pixel in earth image space
+  const worldY=(cy-view.y)/view.scale;
+  const gx=Math.floor(worldX/earthW*SIM_W);
+  const gy=Math.floor(worldY/earthH*SIM_H);
+  if(gx<0||gx>=SIM_W||gy<0||gy>=SIM_H)return;
+  const gi=gy*SIM_W+gx;
   if(!state.playerSpawned){
     if(state.landMask[gi]&&state.owners[gi]<0){
       spawnPlayer(0,gx,gy);state.playerSpawned=true;
@@ -658,7 +621,7 @@ function handleClick(cx,cy){
   }
 }
 
-// ── SPEED CONTROLS ───────────────────────────────────────────
+// ── CONTROLS ─────────────────────────────────────────────────
 document.getElementById('slowBtn').addEventListener('click',()=>{
   state.speed=Math.max(1,state.speed===1?1:state.speed/2);
   document.getElementById('speedLabel').textContent=state.speed+'×';
@@ -667,16 +630,12 @@ document.getElementById('fastBtn').addEventListener('click',()=>{
   state.speed=Math.min(8,state.speed*2);
   document.getElementById('speedLabel').textContent=state.speed+'×';
 });
-
-// ── DIFFICULTY ───────────────────────────────────────────────
 document.querySelectorAll('.diff-btn').forEach(btn=>{
   btn.addEventListener('click',()=>{
     document.querySelectorAll('.diff-btn').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');state.difficulty=btn.dataset.d;
   });
 });
-
-// ── SCREEN BUTTONS ───────────────────────────────────────────
 document.getElementById('startBtn').addEventListener('click',startGame);
 document.getElementById('replayBtn').addEventListener('click',resetGame);
 document.getElementById('howtoBtn').addEventListener('click',()=>{
