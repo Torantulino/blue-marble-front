@@ -132,6 +132,7 @@ let earthImg=null,earthW=0,earthH=0;
 let landMask=null; // Uint8Array, 1=land 0=ocean, length SIM_W*SIM_H
 let overlayCanvas=null;
 let owners=null,troops=null,alive=null,colors=null,tileCounts=null,maxTroopsArr=null;
+let overlayCtx=null,overlayImageData=null;
 let view={x:0,y:0,scale:1};
 let playerIdx=-1,gameStarted=false,gameOver=false;
 let tickN=0,simInterval=null,simDelay=200;
@@ -206,6 +207,8 @@ async function loadNASAImages(){
   setLoad(80,'Building overlay canvas…');
   overlayCanvas=document.createElement('canvas');
   overlayCanvas.width=SIM_W;overlayCanvas.height=SIM_H;
+  overlayCtx=overlayCanvas.getContext('2d');
+  overlayImageData=overlayCtx.createImageData(SIM_W,SIM_H);
   setLoad(95,'Ready!');
 }
 
@@ -327,10 +330,8 @@ function simTick(){
 
 // ── Overlay & minimap ─────────────────────────────────────────────────────────
 function updateOverlay(){
-  const oc=overlayCanvas.getContext('2d');
-  const img=oc.createImageData(SIM_W,SIM_H);
-  const d=img.data;
-  const N=N_AI+1;
+  const d=overlayImageData.data;
+  d.fill(0);
   const rgbs=colors.map(hex2rgb);
   for(let i=0;i<SIM_W*SIM_H;i++){
     const o=owners[i];if(o<0)continue;
@@ -338,7 +339,7 @@ function updateOverlay(){
     const idx=i*4;
     d[idx]=c.r;d[idx+1]=c.g;d[idx+2]=c.b;d[idx+3]=alive[o]?160:50;
   }
-  oc.putImageData(img,0,0);
+  overlayCtx.putImageData(overlayImageData,0,0);
 }
 
 function updateMinimap(){
