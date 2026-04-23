@@ -1346,16 +1346,23 @@ fn process_attack(
                         t.alive = false;
                     }
                 }
+                // The captured tile is no longer on the border — it's ours now.
+                // Without removing it the border grows monotonically, which (a)
+                // inflates `attack_tiles_per_tick` (proportional to border.len)
+                // so a single tick burns through the whole heap, and (b) makes
+                // the cascade behaviour of the count-based priority visible as
+                // long vertical/horizontal stripes of one-column-at-a-time
+                // captures instead of a roughly cohesive front.
+                border_set.remove(&tile);
                 // Enqueue the captured tile's outward neighbours so the front
                 // keeps advancing.
                 let pushed = enqueue_tile_neighbors(
                     cache, attacker.id, attack.target, tx, ty, current_tick);
                 for (ntile, nprio) in pushed {
                     if border_set.insert(ntile) {
-                        if attack.border.len() < ATTACK_HEAP_CAP {
-                            attack.border.push(ntile);
+                        if border_set.len() <= ATTACK_HEAP_CAP {
+                            heap.push(Reverse((nprio, ntile)));
                         }
-                        heap.push(Reverse((nprio, ntile)));
                     }
                 }
             }
@@ -1369,6 +1376,13 @@ fn process_attack(
     }
 
     if !deleted {
+        // Rebuild the persisted border from the in-memory set so it reflects
+        // the actual current frontier (with captures removed and additions
+        // included).
+        attack.border = border_set.iter().copied().collect();
+        if attack.border.len() > ATTACK_HEAP_CAP {
+            attack.border.truncate(ATTACK_HEAP_CAP);
+        }
         attack.to_conquer_tiles.clear();
         attack.to_conquer_priorities.clear();
         for Reverse((p, t)) in heap {
