@@ -236,6 +236,33 @@ pub fn create_match(ctx: &ReducerContext, name: String, difficulty: u8) -> Resul
 }
 
 #[spacetimedb::reducer]
+pub fn leave_match(ctx: &ReducerContext, match_id: u64) -> Result<(), String> {
+    let m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
+    let me = ctx.db.players().match_id().filter(match_id)
+        .find(|p| p.identity == ctx.sender && !p.is_bot)
+        .ok_or("Not in match")?;
+    match m.phase {
+        PHASE_LOBBY => {
+            // Hard-delete the lobby player row — other players see them vanish.
+            ctx.db.players().id().delete(me.id);
+        }
+        _ => {
+            // In-flight match: flag the player dead, drop their troops. Their
+            // tiles stay on the map and get absorbed by neighbours via the
+            // normal passive-expansion / attack loop. Any open attacks they
+            // launched clean themselves up in step_match when attacker.alive
+            // is false.
+            let mut me = me;
+            me.alive = false;
+            me.troops = 0.0;
+            me.frontier_tiles.clear();
+            ctx.db.players().id().update(me);
+        }
+    }
+    Ok(())
+}
+
+#[spacetimedb::reducer]
 pub fn join_match(ctx: &ReducerContext, match_id: u64, name: String) -> Result<(), String> {
     let m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
     if m.phase != PHASE_LOBBY {

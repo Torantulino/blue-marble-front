@@ -41,6 +41,8 @@ let gameOver = false;
 let tickN = 0;
 let totalLand = 0;
 let chatOpen = false;
+let selectedDifficulty = 1; // 0 Easy, 1 Normal, 2 Hard — set by .diff-btn clicks.
+let pendingCreate: null | { quick: boolean; name: string } = null;
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
@@ -51,6 +53,7 @@ const loadBar = document.getElementById('loadBar') as HTMLDivElement;
 const loadMsg = document.getElementById('loadMsg') as HTMLDivElement;
 const loading = document.getElementById('loading') as HTMLDivElement;
 const startScreen = document.getElementById('startScreen') as HTMLDivElement;
+const howtoScreen = document.getElementById('howtoScreen') as HTMLDivElement;
 const listScreen = document.getElementById('listScreen') as HTMLDivElement;
 const lobbyScreen = document.getElementById('lobbyScreen') as HTMLDivElement;
 const hud = document.getElementById('hud') as HTMLDivElement;
@@ -167,6 +170,42 @@ function setupDbListeners() {
       if (newRow.phase === PHASE_PLAYING && oldRow.phase === PHASE_SPAWN) {
         statusEl.textContent = 'Game started! Click enemy territory to attack.';
       }
+      if (oldRow.speedMultiplier !== newRow.speedMultiplier) {
+        updateSpeedUI(newRow.speedMultiplier);
+      }
+    }
+  });
+
+  conn.db.matches.onInsert((_ctx, row) => {
+    // React to our own createMatch landing: join, optionally auto-populate bots, enter lobby.
+    if (!pendingCreate) return;
+    if (row.creator.toHexString() !== myIdentityHex) return;
+    if (row.name !== pendingCreate.name) return;
+    const { quick } = pendingCreate;
+    pendingCreate = null;
+    currentMatchId = Number(row.id);
+    conn.reducers.joinMatch({ matchId: row.id, name: 'Player' }).catch(reducerErr);
+    enterLobby();
+    if (quick) {
+      // MAX_PLAYERS=13 on the server (12 bots + us). Fire all addBot calls.
+      const botNames = BOT_NAMES.slice();
+      for (let i = 0; i < 12; i++) {
+        conn.reducers.addBot({ matchId: row.id, botName: botNames[i] ?? `Bot${i}` }).catch(reducerErr);
+      }
+      // Start once all 13 player rows have landed.
+      const tryStart = () => {
+        const count = Array.from(conn.db.players.iter())
+          .filter(p => Number(p.matchId) === currentMatchId).length;
+        if (count >= 13) {
+          conn.reducers.startMatch({ matchId: row.id }).catch(reducerErr);
+          return true;
+        }
+        return false;
+      };
+      if (!tryStart()) {
+        const check = setInterval(() => { if (tryStart()) clearInterval(check); }, 100);
+        setTimeout(() => clearInterval(check), 5000);
+      }
     }
   });
 
@@ -247,23 +286,54 @@ function escapeHtml(s: string): string {
 }
 
 // ── UI event handlers ──────────────────────────────────────────────────────────
-document.getElementById('btnCreate')!.addEventListener('click', () => {
-  const name = 'Match ' + Math.floor(Math.random() * 9999);
-  conn.reducers.createMatch({ name, difficulty: 1 }).catch(reducerErr);
-  const check = setInterval(() => {
-    if (!myIdentityHex) return;
-    for (const m of conn.db.matches.iter()) {
-      if (m.creator.toHexString() === myIdentityHex) {
-        clearInterval(check);
-        currentMatchId = Number(m.id);
-        conn.reducers.joinMatch({ matchId: m.id, name: 'Player' }).catch(reducerErr);
-        enterLobby();
-        break;
-      }
-    }
-  }, 200);
-  setTimeout(() => clearInterval(check), 5000);
+const BOT_NAMES = [
+  'AlphaBot', 'BetaBot', 'GammaBot', 'DeltaBot', 'EpsilonBot',
+  'ZetaBot', 'EtaBot', 'ThetaBot', 'IotaBot', 'KappaBot',
+  'LambdaBot', 'MuBot',
+];
+
+function requestCreateMatch(quick: boolean) {
+  const name = (quick ? 'Quick ' : 'Match ') + Math.floor(Math.random() * 9999);
+  pendingCreate = { quick, name };
+  conn.reducers.createMatch({ name, difficulty: selectedDifficulty }).catch(e => {
+    pendingCreate = null;
+    reducerErr(e);
+  });
+  // Safety timeout — if the onInsert listener never matches, clear pending.
+  setTimeout(() => {
+    if (pendingCreate && pendingCreate.name === name) pendingCreate = null;
+  }, 5000);
+}
+
+document.getElementById('btnCreate')!.addEventListener('click', () => requestCreateMatch(false));
+document.getElementById('btnQuickMatch')!.addEventListener('click', () => requestCreateMatch(true));
+
+// .diff-btn click handlers (Easy/Normal/Hard).
+for (const btn of Array.from(document.querySelectorAll<HTMLButtonElement>('.diff-btn'))) {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.diff-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedDifficulty = Number(btn.dataset.d ?? 1);
+  });
+}
+
+document.getElementById('btnHowTo')!.addEventListener('click', () => {
+  hide(startScreen);
+  show(howtoScreen);
 });
+document.getElementById('btnHowToBack')!.addEventListener('click', () => {
+  hide(howtoScreen);
+  show(startScreen);
+});
+
+// Speed controls.
+for (const btn of Array.from(document.querySelectorAll<HTMLButtonElement>('.speed-btn'))) {
+  btn.addEventListener('click', () => {
+    if (currentMatchId === -1) return;
+    const speed = Number(btn.dataset.s ?? 4);
+    conn.reducers.setSpeed({ matchId: BigInt(currentMatchId), speedMultiplier: speed }).catch(reducerErr);
+  });
+}
 
 document.getElementById('btnList')!.addEventListener('click', () => {
   hide(startScreen);
@@ -284,13 +354,15 @@ document.getElementById('btnStart')!.addEventListener('click', () => {
 
 document.getElementById('btnAddBot')!.addEventListener('click', () => {
   if (currentMatchId !== -1) {
-    const names = ['AlphaBot', 'BetaBot', 'GammaBot', 'DeltaBot', 'EpsilonBot'];
-    const botName = names[Math.floor(Math.random() * names.length)];
+    const botName = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
     conn.reducers.addBot({ matchId: BigInt(currentMatchId), botName }).catch(reducerErr);
   }
 });
 
 document.getElementById('btnLeave')!.addEventListener('click', () => {
+  if (currentMatchId !== -1) {
+    conn.reducers.leaveMatch({ matchId: BigInt(currentMatchId) }).catch(reducerErr);
+  }
   currentMatchId = -1;
   myPlayerId = -1;
   hide(lobbyScreen);
@@ -427,6 +499,19 @@ function syncHudCssVars() {
   const bottomH = bottomBar.classList.contains('hidden') ? 0 : bottomBar.getBoundingClientRect().height;
   document.documentElement.style.setProperty('--hud-h', hudH + 'px');
   document.documentElement.style.setProperty('--bottom-h', bottomH + 'px');
+}
+
+function updateSpeedUI(speedMultiplier: number) {
+  const label = speedMultiplier === 2 ? '½×'
+    : speedMultiplier === 4 ? '1×'
+    : speedMultiplier === 8 ? '2×'
+    : speedMultiplier === 16 ? '4×'
+    : `${speedMultiplier / 4}×`;
+  const labelEl = document.getElementById('speedLabel');
+  if (labelEl) labelEl.textContent = label;
+  for (const btn of Array.from(document.querySelectorAll<HTMLButtonElement>('.speed-btn'))) {
+    btn.classList.toggle('active', Number(btn.dataset.s) === speedMultiplier);
+  }
 }
 
 function worldToScreen(wx: number, wy: number) {

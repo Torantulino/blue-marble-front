@@ -19,4 +19,7 @@ export default __t.row({
   createdAt: __t.timestamp().name("created_at"),
   winner: __t.option(__t.u32()),
   totalLand: __t.u32().name("total_land"),
+  difficulty: __t.u8(),
+  speedMultiplier: __t.u8().name("speed_multiplier"),
+  subTickAccum: __t.u8().name("sub_tick_accum"),
 });

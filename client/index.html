@@ -12,7 +12,20 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
 .screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:all;background:rgba(0,0,0,0.85);backdrop-filter:blur(6px);}
 .screen.hidden{display:none !important;}
 #startScreen h1{font-size:clamp(2rem,6vw,4rem);font-weight:900;letter-spacing:0.05em;background:linear-gradient(135deg,#4af,#0cf,#4af);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-align:center;margin-bottom:0.3em;}
-#startScreen .sub{font-size:clamp(0.9rem,2vw,1.2rem);color:#8cf;margin-bottom:2em;text-align:center;max-width:520px;line-height:1.6;}
+#startScreen .sub{font-size:clamp(0.9rem,2vw,1.2rem);color:#8cf;margin-bottom:1.5em;text-align:center;max-width:520px;line-height:1.6;}
+#startScreen .features{display:flex;gap:1.2em;flex-wrap:wrap;justify-content:center;margin-bottom:1.5em;max-width:620px;}
+#startScreen .feat{background:rgba(0,180,255,0.08);border:1px solid rgba(0,180,255,0.25);border-radius:12px;padding:0.9em 1.2em;text-align:center;font-size:0.82rem;color:#adf;flex:0 0 128px;}
+#startScreen .feat .icon{font-size:1.7em;margin-bottom:0.3em;}
+.diff-select{display:flex;gap:0.7em;margin-bottom:1em;}
+.diff-btn{padding:0.5em 1.4em;border-radius:20px;border:1px solid rgba(100,200,255,0.35);background:rgba(0,100,200,0.12);color:#9cf;font-size:0.9rem;cursor:pointer;transition:all 0.15s;pointer-events:all;}
+.diff-btn.active{background:rgba(0,150,255,0.35);border-color:#0af;color:#fff;}
+#howtoScreen .howto-body{text-align:left;line-height:2.1;color:#cdf;font-size:0.92rem;max-width:500px;}
+#howtoScreen .howto-body b{color:#4df;}
+#speedCtrl{display:flex;align-items:center;gap:0.4em;font-size:0.75rem;color:#68a;}
+.speed-btn{min-width:28px;padding:0.25em 0.55em;height:26px;border-radius:13px;border:1px solid rgba(0,180,255,0.3);background:rgba(0,80,180,0.2);color:#9cf;font-size:0.78rem;cursor:pointer;}
+.speed-btn:hover{background:rgba(0,120,255,0.35);}
+.speed-btn.active{background:rgba(0,150,255,0.4);border-color:#0af;color:#fff;}
+#speedLabel{min-width:36px;text-align:center;color:#adf;font-weight:700;}
 .btn{padding:0.85em 2.5em;font-size:1.1rem;font-weight:700;border:none;border-radius:30px;cursor:pointer;letter-spacing:0.05em;transition:all 0.18s;pointer-events:all;margin:0.3em;}
 .btn-primary{background:linear-gradient(135deg,#0af,#07f);color:#fff;box-shadow:0 0 24px rgba(0,170,255,0.4);}
 .btn-primary:hover{transform:scale(1.05);box-shadow:0 0 36px rgba(0,170,255,0.6);}
@@ -77,9 +90,37 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
 
   <div class="screen hidden" id="startScreen">
     <h1>🌍 Blue Marble Front</h1>
-    <p class="sub">M1 Alpha — SpacetimeDB multiplayer.<br>Claim tiles, grow your forces, own the planet.</p>
-    <button class="btn btn-primary" id="btnCreate">➕ Create Match</button>
+    <p class="sub">Global conquest on NASA's real Blue Marble Earth.<br>Claim tiles, grow your forces, own the planet.</p>
+    <div class="features">
+      <div class="feat"><div class="icon">🛰️</div>NASA Blue<br>Marble 5400px</div>
+      <div class="feat"><div class="icon">🗺️</div>1:1 Pixel<br>Tile Grid</div>
+      <div class="feat"><div class="icon">⚔️</div>Territory<br>Expansion</div>
+      <div class="feat"><div class="icon">🤖</div>12 AI<br>Nations</div>
+    </div>
+    <div class="diff-select">
+      <button class="diff-btn" data-d="0">🟢 Easy</button>
+      <button class="diff-btn active" data-d="1">🟡 Normal</button>
+      <button class="diff-btn" data-d="2">🔴 Hard</button>
+    </div>
+    <button class="btn btn-primary" id="btnQuickMatch">⚡ Quick Match</button>
+    <button class="btn btn-secondary" id="btnCreate">➕ Create Match</button>
     <button class="btn btn-secondary" id="btnList">🌐 Browse Matches</button>
+    <button class="btn btn-secondary" id="btnHowTo">📖 How to Play</button>
+  </div>
+
+  <div class="screen hidden" id="howtoScreen">
+    <h2 style="color:#4af;margin-bottom:1em;font-size:1.5rem;">📖 How to Play</h2>
+    <div class="howto-body">
+      <b>🖱️ Click</b> any land tile to spawn your nation<br>
+      <b>🗺️ Pan</b> drag · <b>🔍 Zoom</b> scroll / pinch<br>
+      <b>⚔️ Troops</b> grow automatically and expand your borders<br>
+      <b>🎯 Attack</b> click an enemy tile to launch a directed attack<br>
+      <b>🏙️ Cities</b> spend gold to raise your troop cap<br>
+      <b>🏆 Win</b> by holding 80% of all land tiles<br>
+      <b>💀 Lose</b> if all your tiles are captured<br>
+      <b>⏩ Speed</b> ½× / 1× / 2× / 4× on the bottom bar
+    </div>
+    <button class="btn btn-primary" id="btnHowToBack" style="margin-top:1.5em;">← Back</button>
   </div>
 
   <div class="screen hidden" id="listScreen">
@@ -108,6 +149,14 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
 
   <div id="bottomBar" class="hidden">
     <div id="status">Click any land tile to spawn!</div>
+    <div id="speedCtrl">
+      <span>Speed:</span>
+      <button class="speed-btn" id="btnSpeed05" data-s="2">½×</button>
+      <button class="speed-btn active" id="btnSpeed1" data-s="4">1×</button>
+      <button class="speed-btn" id="btnSpeed2" data-s="8">2×</button>
+      <button class="speed-btn" id="btnSpeed4" data-s="16">4×</button>
+      <span id="speedLabel">1×</span>
+    </div>
     <div id="actionBar">
       <button class="btn btn-secondary" id="btnBuildCity" style="padding:0.5em 1em;font-size:0.8rem;">🏙️ Build City</button>
       <button class="btn btn-danger" id="btnRetreat" style="padding:0.5em 1em;font-size:0.8rem;">🏳️ Retreat</button>
