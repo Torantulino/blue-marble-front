@@ -36,6 +36,7 @@ let overlayImageData: ImageData | null = null;
 let overlayDirty = true;
 let minimapCanvas: HTMLCanvasElement | null = null;
 let minimapCtx: CanvasRenderingContext2D | null = null;
+let placementMode: 'none' | 'city' = 'none';
 let view = { x: 0, y: 0, scale: 1 };
 let gameOver = false;
 let tickN = 0;
@@ -297,13 +298,31 @@ document.getElementById('btnLeave')!.addEventListener('click', () => {
   show(startScreen);
 });
 
+function setPlacementMode(mode: 'none' | 'city') {
+  placementMode = mode;
+  document.body.classList.toggle('mode-city', mode === 'city');
+  if (mode === 'city') {
+    statusEl.textContent = 'Click one of your tiles to build a city. Esc to cancel.';
+  }
+}
+
 document.getElementById('btnBuildCity')!.addEventListener('click', () => {
-  statusEl.textContent = 'Click one of your tiles to build a city.';
-  if (currentMatchId !== -1 && myPlayerId !== -1) {
-    const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
-    if (me && me.spawnTile !== null && me.spawnTile !== undefined) {
-      conn.reducers.buildCity({ matchId: BigInt(currentMatchId), tile: me.spawnTile }).catch(reducerErr);
-    }
+  if (currentMatchId === -1 || myPlayerId === -1) return;
+  setPlacementMode(placementMode === 'city' ? 'none' : 'city');
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && placementMode !== 'none') {
+    setPlacementMode('none');
+    statusEl.textContent = 'Placement cancelled.';
+  }
+});
+
+canvas.addEventListener('contextmenu', (e) => {
+  if (placementMode !== 'none') {
+    e.preventDefault();
+    setPlacementMode('none');
+    statusEl.textContent = 'Placement cancelled.';
   }
 });
 
@@ -588,6 +607,12 @@ canvas.addEventListener('click', (e) => {
   const tile = ty * SIM_W + tx;
 
   if (currentMatchId === -1 || myPlayerId === -1) return;
+
+  if (placementMode === 'city') {
+    conn.reducers.buildCity({ matchId: BigInt(currentMatchId), tile }).catch(reducerErr);
+    setPlacementMode('none');
+    return;
+  }
 
   if (currentPhase === PHASE_SPAWN) {
     conn.reducers.spawn({ matchId: BigInt(currentMatchId), tile }).catch(reducerErr);
