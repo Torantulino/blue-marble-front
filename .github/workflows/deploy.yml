@@ -45,7 +45,9 @@ jobs:
           spacetime login --token "$SPACETIMEDB_TOKEN"
           cd spacetime-module
           spacetime build
-          spacetime publish --yes blue-marble-front
+          # --delete-data=on-conflict: only wipe data when a schema change
+          # would otherwise abort. Alpha-game policy; matches can be re-created.
+          spacetime publish --yes --delete-data=on-conflict blue-marble-front
 
       - name: Generate TypeScript Bindings
         run: |
