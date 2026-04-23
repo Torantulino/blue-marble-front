@@ -15,6 +15,11 @@ export default __t.row({
   matchId: __t.u64().name("match_id"),
   attacker: __t.u32(),
   target: __t.u32(),
-  troopsCommitted: __t.f32().name("troops_committed"),
+  troops: __t.f32(),
   retreating: __t.bool(),
+  border: __t.array(__t.u32()),
+  toConquerTiles: __t.array(__t.u32()).name("to_conquer_tiles"),
+  toConquerPriorities: __t.array(__t.i32()).name("to_conquer_priorities"),
+  sourceTile: __t.option(__t.u32()).name("source_tile"),
+  lastRefreshTick: __t.u64().name("last_refresh_tick"),
 });

@@ -12,6 +12,7 @@
     "bake:mask": "node scripts/bake-ocean-mask.mjs"
   },
   "devDependencies": {
+    "jpeg-js": "^0.4.4",
     "pngjs": "^7.0.0"
   }
 }
