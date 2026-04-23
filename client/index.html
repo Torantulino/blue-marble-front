@@ -55,7 +55,7 @@ body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow
 #matchList .match-row:hover{background:rgba(0,150,255,0.2);}
 #matchList .match-row .mname{flex:1;font-size:0.9rem;color:#cdf;}
 #matchList .match-row .mstatus{font-size:0.7rem;color:#8cf;}
-#chatPanel{position:absolute;right:0;top:48px;bottom:48px;width:280px;background:rgba(0,10,30,0.85);border-left:1px solid rgba(0,180,255,0.2);display:flex;flex-direction:column;pointer-events:all;z-index:9;}
+#chatPanel{position:absolute;right:0;top:var(--hud-h,48px);bottom:var(--bottom-h,52px);width:280px;background:rgba(0,10,30,0.85);border-left:1px solid rgba(0,180,255,0.2);display:flex;flex-direction:column;pointer-events:all;z-index:9;}
 #chatPanel.hidden{display:none !important;}
 #chatMessages{flex:1;overflow-y:auto;padding:0.5em;display:flex;flex-direction:column;gap:0.3em;font-size:0.8rem;}
 #chatMessages .chat-msg{color:#cdf;}
