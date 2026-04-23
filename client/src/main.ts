@@ -765,7 +765,7 @@ function drawPlayerLabels() {
     const sx = anchor.x * SCALE * view.scale - view.x;
     const sy = anchor.y * SCALE * view.scale - view.y;
     if (sx < -80 || sx > canvas.width + 80 || sy < -20 || sy > canvas.height + 20) continue;
-    const label = `${p.name} · ${Number(p.tiles).toLocaleString()}`;
+    const label = `${p.name} · ${Math.floor(Number(p.troops)).toLocaleString()}`;
     ctx.strokeText(label, sx, sy);
     ctx.fillStyle = COLORS[p.color % COLORS.length];
     ctx.fillText(label, sx, sy);
