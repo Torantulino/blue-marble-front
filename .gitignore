@@ -3,6 +3,14 @@ client/node_modules/
 client/dist/
 client/.vite/
 
+# Root (build tooling for bake scripts)
+/node_modules/
+/dist-test/
+/probe.mjs
+/probe*.png
+/after*.png
+/p[0-9]*.png
+
 # SpacetimeDB module
 spacetime-module/target/
 spacetime-module/Cargo.lock
