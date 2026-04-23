@@ -27,4 +27,5 @@ export default __t.row({
   cityCount: __t.u32().name("city_count"),
   cityLevels: __t.u32().name("city_levels"),
   frontierTiles: __t.array(__t.u32()).name("frontier_tiles"),
+  ownedChunks: __t.array(__t.u64()).name("owned_chunks"),
 });

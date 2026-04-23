@@ -32,10 +32,13 @@ let currentPhase = PHASE_LOBBY;
 let earthImg: HTMLImageElement | null = null;
 let overlayCanvas: HTMLCanvasElement | null = null;
 let overlayCtx: CanvasRenderingContext2D | null = null;
-let overlayImageData: ImageData | null = null;
-let overlayDirty = true;
 let minimapCanvas: HTMLCanvasElement | null = null;
 let minimapCtx: CanvasRenderingContext2D | null = null;
+// Per-chunk cached offscreen canvases at VISUAL resolution (CHUNK_SIZE*SCALE per side).
+// Only dirty chunks get redrawn; the rest are blitted from cache.
+const chunkCanvases = new Map<number, HTMLCanvasElement>();
+// Chunk rows awaiting re-render. Keyed by chunkId so repeated updates dedupe.
+const dirtyChunks = new Map<number, any>();
 let placementMode: 'none' | 'city' = 'none';
 let view = { x: 0, y: 0, scale: 1 };
 let gameOver = false;
@@ -126,15 +129,17 @@ function connectStdb() {
 
 async function loadNASAImages() {
   earthImg = await loadImg(VISUAL_URL);
+  // Composition layer: dirty chunks draw into this; per-frame render blits it once.
   overlayCanvas = document.createElement('canvas');
   overlayCanvas.width = VISUAL_W;
   overlayCanvas.height = VISUAL_H;
   overlayCtx = overlayCanvas.getContext('2d')!;
-  overlayImageData = overlayCtx.createImageData(VISUAL_W, VISUAL_H);
   minimapCanvas = document.createElement('canvas');
   minimapCanvas.width = minimap.width;
   minimapCanvas.height = minimap.height;
   minimapCtx = minimapCanvas.getContext('2d')!;
+  minimapCtx.fillStyle = '#001122';
+  minimapCtx.fillRect(0, 0, minimapCanvas.width, minimapCanvas.height);
   fitView();
 }
 
@@ -147,7 +152,9 @@ function fitView() {
   view.y = Math.max(0, (VISUAL_H * view.scale - canvas.height) / 2);
 }
 
-function markOverlayDirty() { overlayDirty = true; }
+function markChunkDirty(row: any) {
+  dirtyChunks.set(Number(row.id), row);
+}
 
 // ── DB listeners ───────────────────────────────────────────────────────────────
 function setupDbListeners() {
@@ -224,8 +231,8 @@ function setupDbListeners() {
     }
   });
 
-  conn.db.tile_chunks.onInsert(markOverlayDirty);
-  conn.db.tile_chunks.onUpdate(markOverlayDirty);
+  conn.db.tile_chunks.onInsert((_ctx, row) => markChunkDirty(row));
+  conn.db.tile_chunks.onUpdate((_ctx, _old, row) => markChunkDirty(row));
 
   conn.db.players.onUpdate((_ctx, _oldRow, newRow) => {
     if (Number(newRow.id) === myPlayerId) {
@@ -547,45 +554,68 @@ function screenToWorld(sx: number, sy: number) {
   };
 }
 
-function rebuildOverlay() {
-  if (!overlayImageData || !overlayCtx || !minimapCtx || !minimapCanvas) return;
-  const data = overlayImageData.data;
-  data.fill(0);
-  minimapCtx.fillStyle = '#001122';
-  minimapCtx.fillRect(0, 0, minimapCanvas.width, minimapCanvas.height);
+// Redraw one chunk into its cached offscreen canvas, then composite onto
+// overlayCanvas at its world position and update the minimap cells. Called
+// only for chunks in `dirtyChunks`.
+const CHUNK_PX = CHUNK_SIZE * SCALE; // 128
+
+function redrawChunk(chunk: any) {
+  if (!overlayCtx || !minimapCtx || !minimapCanvas) return;
+  if (Number(chunk.matchId) !== currentMatchId) return;
+  const chunkId = Number(chunk.id);
+  let canvas = chunkCanvases.get(chunkId);
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    canvas.width = CHUNK_PX;
+    canvas.height = CHUNK_PX;
+    chunkCanvases.set(chunkId, canvas);
+  }
+  const cctx = canvas.getContext('2d')!;
+  cctx.clearRect(0, 0, CHUNK_PX, CHUNK_PX);
+
+  const cx = chunk.chunkX;
+  const cy = chunk.chunkY;
+  const worldX = cx * CHUNK_SIZE * SCALE;
+  const worldY = cy * CHUNK_SIZE * SCALE;
   const mmScaleX = minimapCanvas.width / VISUAL_W;
   const mmScaleY = minimapCanvas.height / VISUAL_H;
 
-  for (const chunk of conn.db.tile_chunks.iter()) {
-    if (Number(chunk.matchId) !== currentMatchId) continue;
-    const cx = chunk.chunkX;
-    const cy = chunk.chunkY;
-    for (let ly = 0; ly < CHUNK_SIZE; ly++) {
-      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
-        const idx = ly * CHUNK_SIZE + lx;
-        const owner = chunk.owners[idx];
-        if (owner === 255) continue;
-        const tx = cx * CHUNK_SIZE + lx;
-        const ty = cy * CHUNK_SIZE + ly;
-        if (tx >= SIM_W || ty >= SIM_H) continue;
-        const color = hex2rgb(COLORS[owner % COLORS.length]);
-        const vx = tx * SCALE;
-        const vy = ty * SCALE;
-        for (let dy = 0; dy < SCALE; dy++) {
-          for (let dx = 0; dx < SCALE; dx++) {
-            const pi = ((vy + dy) * VISUAL_W + (vx + dx)) * 4;
-            data[pi] = color[0];
-            data[pi + 1] = color[1];
-            data[pi + 2] = color[2];
-            data[pi + 3] = 180;
-          }
-        }
-        minimapCtx.fillStyle = COLORS[owner % COLORS.length];
-        minimapCtx.fillRect(tx * mmScaleX, ty * mmScaleY, mmScaleX + 0.5, mmScaleY + 0.5);
-      }
+  // Clear minimap cells under this chunk before re-painting.
+  minimapCtx.fillStyle = '#001122';
+  minimapCtx.fillRect(
+    cx * CHUNK_SIZE * mmScaleX,
+    cy * CHUNK_SIZE * mmScaleY,
+    CHUNK_SIZE * mmScaleX + 1,
+    CHUNK_SIZE * mmScaleY + 1,
+  );
+
+  for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+    for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+      const owner = chunk.owners[ly * CHUNK_SIZE + lx];
+      if (owner === 255) continue;
+      const tx = cx * CHUNK_SIZE + lx;
+      const ty = cy * CHUNK_SIZE + ly;
+      if (tx >= SIM_W || ty >= SIM_H) continue;
+      const color = COLORS[owner % COLORS.length];
+      cctx.fillStyle = color;
+      cctx.fillRect(lx * SCALE, ly * SCALE, SCALE, SCALE);
+      minimapCtx.fillStyle = color;
+      minimapCtx.fillRect(tx * mmScaleX, ty * mmScaleY, mmScaleX + 0.5, mmScaleY + 0.5);
     }
   }
-  overlayCtx.putImageData(overlayImageData, 0, 0);
+
+  // Blit this chunk's cached canvas onto the big composition canvas. Clear
+  // first so tiles that flipped to 255 (unclaimed) stop showing.
+  overlayCtx.clearRect(worldX, worldY, CHUNK_PX, CHUNK_PX);
+  overlayCtx.drawImage(canvas, worldX, worldY);
+}
+
+function flushDirtyChunks() {
+  if (dirtyChunks.size === 0) return;
+  for (const [, row] of dirtyChunks) {
+    redrawChunk(row);
+  }
+  dirtyChunks.clear();
 }
 
 function render() {
@@ -598,15 +628,17 @@ function render() {
     ctx.drawImage(earthImg, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
   }
 
-  if (overlayDirty) {
-    rebuildOverlay();
-    overlayDirty = false;
-  }
+  // Repaint any dirty chunks into their caches + overlayCanvas. Bundled here
+  // (rather than in the subscription callbacks) so many per-tick chunk
+  // updates coalesce into one redraw per rAF.
+  flushDirtyChunks();
 
   if (overlayCanvas) {
     const tl = worldToScreen(0, 0);
     const br = worldToScreen(VISUAL_W, VISUAL_H);
+    ctx.globalAlpha = 0.7;
     ctx.drawImage(overlayCanvas, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+    ctx.globalAlpha = 1;
   }
 
   // Minimap: blit cached minimap, then draw viewport rect
@@ -624,13 +656,6 @@ function render() {
   }
 
   requestAnimationFrame(render);
-}
-
-function hex2rgb(hex: string): [number, number, number] {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return [r, g, b];
 }
 
 // ── Input ──────────────────────────────────────────────────────────────────────
