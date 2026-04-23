@@ -33,6 +33,9 @@ let earthImg: HTMLImageElement | null = null;
 let overlayCanvas: HTMLCanvasElement | null = null;
 let overlayCtx: CanvasRenderingContext2D | null = null;
 let overlayImageData: ImageData | null = null;
+let overlayDirty = true;
+let minimapCanvas: HTMLCanvasElement | null = null;
+let minimapCtx: CanvasRenderingContext2D | null = null;
 let view = { x: 0, y: 0, scale: 1 };
 let gameOver = false;
 let tickN = 0;
@@ -60,6 +63,7 @@ const chatMessages = document.getElementById('chatMessages') as HTMLDivElement;
 function show(el: HTMLElement) { el.classList.remove('hidden'); }
 function hide(el: HTMLElement) { el.classList.add('hidden'); }
 function setLoad(pct: number, msg: string) { loadBar.style.width = pct + '%'; loadMsg.textContent = msg; }
+function reducerErr(e: any) { statusEl.textContent = '⚠️ ' + (e?.message || e); }
 
 // ── Image loader ───────────────────────────────────────────────────────────────
 function loadImg(url: string): Promise<HTMLImageElement> {
@@ -123,7 +127,23 @@ async function loadNASAImages() {
   overlayCanvas.height = VISUAL_H;
   overlayCtx = overlayCanvas.getContext('2d')!;
   overlayImageData = overlayCtx.createImageData(VISUAL_W, VISUAL_H);
+  minimapCanvas = document.createElement('canvas');
+  minimapCanvas.width = minimap.width;
+  minimapCanvas.height = minimap.height;
+  minimapCtx = minimapCanvas.getContext('2d')!;
+  fitView();
 }
+
+function fitView() {
+  if (!canvas.width || !canvas.height) return;
+  const scX = canvas.width / VISUAL_W;
+  const scY = canvas.height / VISUAL_H;
+  view.scale = Math.min(scX, scY);
+  view.x = Math.max(0, (VISUAL_W * view.scale - canvas.width) / 2);
+  view.y = Math.max(0, (VISUAL_H * view.scale - canvas.height) / 2);
+}
+
+function markOverlayDirty() { overlayDirty = true; }
 
 // ── DB listeners ───────────────────────────────────────────────────────────────
 function setupDbListeners() {
@@ -141,6 +161,7 @@ function setupDbListeners() {
         hide(lobbyScreen);
         show(hud);
         show(bottomBar);
+        syncHudCssVars();
         statusEl.textContent = 'Click a land tile to spawn your nation!';
       }
       if (newRow.phase === PHASE_PLAYING && oldRow.phase === PHASE_SPAWN) {
@@ -156,9 +177,15 @@ function setupDbListeners() {
     if (row.identity.toHexString() === myIdentityHex && !row.isBot) {
       myPlayerId = Number(row.id);
       const hudNation = document.getElementById('hudNation');
-      if (hudNation) hudNation.textContent = row.name;
+      if (hudNation) {
+        hudNation.textContent = row.name;
+        hudNation.style.color = COLORS[row.color % COLORS.length];
+      }
     }
   });
+
+  conn.db.tile_chunks.onInsert(markOverlayDirty);
+  conn.db.tile_chunks.onUpdate(markOverlayDirty);
 
   conn.db.players.onUpdate((_ctx, _oldRow, newRow) => {
     if (Number(newRow.id) === myPlayerId) {
@@ -222,14 +249,14 @@ function escapeHtml(s: string): string {
 // ── UI event handlers ──────────────────────────────────────────────────────────
 document.getElementById('btnCreate')!.addEventListener('click', () => {
   const name = 'Match ' + Math.floor(Math.random() * 9999);
-  conn.reducers.createMatch({ name });
+  conn.reducers.createMatch({ name }).catch(reducerErr);
   const check = setInterval(() => {
     if (!myIdentityHex) return;
     for (const m of conn.db.matches.iter()) {
       if (m.creator.toHexString() === myIdentityHex) {
         clearInterval(check);
         currentMatchId = Number(m.id);
-        conn.reducers.joinMatch({ matchId: m.id, name: 'Player' });
+        conn.reducers.joinMatch({ matchId: m.id, name: 'Player' }).catch(reducerErr);
         enterLobby();
         break;
       }
@@ -251,7 +278,7 @@ document.getElementById('btnBackFromList')!.addEventListener('click', () => {
 
 document.getElementById('btnStart')!.addEventListener('click', () => {
   if (currentMatchId !== -1) {
-    conn.reducers.startMatch({ matchId: BigInt(currentMatchId) });
+    conn.reducers.startMatch({ matchId: BigInt(currentMatchId) }).catch(reducerErr);
   }
 });
 
@@ -259,7 +286,7 @@ document.getElementById('btnAddBot')!.addEventListener('click', () => {
   if (currentMatchId !== -1) {
     const names = ['AlphaBot', 'BetaBot', 'GammaBot', 'DeltaBot', 'EpsilonBot'];
     const botName = names[Math.floor(Math.random() * names.length)];
-    conn.reducers.addBot({ matchId: BigInt(currentMatchId), botName });
+    conn.reducers.addBot({ matchId: BigInt(currentMatchId), botName }).catch(reducerErr);
   }
 });
 
@@ -275,19 +302,22 @@ document.getElementById('btnBuildCity')!.addEventListener('click', () => {
   if (currentMatchId !== -1 && myPlayerId !== -1) {
     const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
     if (me && me.spawnTile !== null && me.spawnTile !== undefined) {
-      conn.reducers.buildCity({ matchId: BigInt(currentMatchId), tile: me.spawnTile });
+      conn.reducers.buildCity({ matchId: BigInt(currentMatchId), tile: me.spawnTile }).catch(reducerErr);
     }
   }
 });
 
 document.getElementById('btnRetreat')!.addEventListener('click', () => {
-  if (currentMatchId !== -1 && myPlayerId !== -1) {
-    const atk = Array.from(conn.db.attacks.iter()).find(a => Number(a.attacker) === myPlayerId);
-    if (atk) {
-      conn.reducers.retreatAttack({ matchId: BigInt(currentMatchId), targetPlayer: atk.target });
-    }
-    statusEl.textContent = 'Retreating all attacks.';
+  if (currentMatchId === -1 || myPlayerId === -1) return;
+  const mine = Array.from(conn.db.attacks.iter()).filter(a => Number(a.attacker) === myPlayerId);
+  if (mine.length === 0) {
+    statusEl.textContent = 'No active attacks to retreat.';
+    return;
   }
+  for (const atk of mine) {
+    conn.reducers.retreatAttack({ matchId: BigInt(currentMatchId), targetPlayer: atk.target }).catch(reducerErr);
+  }
+  statusEl.textContent = `Retreating ${mine.length} attack${mine.length === 1 ? '' : 's'}.`;
 });
 
 document.getElementById('btnChat')!.addEventListener('click', () => {
@@ -304,7 +334,7 @@ function sendChat() {
   const input = document.getElementById('chatInput') as HTMLInputElement;
   const text = input.value.trim();
   if (text && currentMatchId !== -1) {
-    conn.reducers.sendChat({ matchId: BigInt(currentMatchId), text });
+    conn.reducers.sendChat({ matchId: BigInt(currentMatchId), text }).catch(reducerErr);
     input.value = '';
   }
 }
@@ -325,7 +355,7 @@ function renderMatchList() {
     row.innerHTML = `<span class="mname">${escapeHtml(m.name)}</span><span class="mstatus">${count}/8</span>`;
     row.addEventListener('click', () => {
       currentMatchId = Number(m.id);
-      conn.reducers.joinMatch({ matchId: m.id, name: 'Player' });
+      conn.reducers.joinMatch({ matchId: m.id, name: 'Player' }).catch(reducerErr);
       enterLobby();
     });
     list.appendChild(row);
@@ -365,16 +395,17 @@ function endGame(won: boolean) {
   document.getElementById('goTitle')!.textContent = won ? '🏆 Victory!' : '💀 Defeat';
   const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
   const tiles = me ? me.tiles : 0;
-  const troops = me ? Math.floor(me.troops) : 0;
   const pct = totalLand > 0 ? Math.floor((tiles / totalLand) * 100) : 0;
+  const aiAlive = Array.from(conn.db.players.iter())
+    .filter(p => Number(p.matchId) === currentMatchId && p.isBot && p.alive).length;
   document.getElementById('goDetail')!.textContent = won
-    ? `You conquered ${pct}% of Earth's land!`
+    ? `You conquered ${pct}% of Earth's land in ${tickN} ticks!`
     : `You were eliminated after ${tickN} ticks.`;
   document.getElementById('goStats')!.innerHTML = `
-    <div class="stat-item"><div class="label">Tiles</div><div class="val">${tiles}</div></div>
-    <div class="stat-item"><div class="label">Troops</div><div class="val">${troops}</div></div>
-    <div class="stat-item"><div class="label">Control</div><div class="val">${pct}%</div></div>
     <div class="stat-item"><div class="label">Ticks</div><div class="val">${tickN}</div></div>
+    <div class="stat-item"><div class="label">Tiles held</div><div class="val">${tiles.toLocaleString()}</div></div>
+    <div class="stat-item"><div class="label">Control</div><div class="val">${pct}%</div></div>
+    <div class="stat-item"><div class="label">AI survivors</div><div class="val">${aiAlive}</div></div>
   `;
 }
 
@@ -382,9 +413,21 @@ function endGame(won: boolean) {
 function resize() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
+  if (earthImg) {
+    fitView();
+    clampView();
+  }
+  syncHudCssVars();
 }
 window.addEventListener('resize', resize);
 resize();
+
+function syncHudCssVars() {
+  const hudH = hud.classList.contains('hidden') ? 0 : hud.getBoundingClientRect().height;
+  const bottomH = bottomBar.classList.contains('hidden') ? 0 : bottomBar.getBoundingClientRect().height;
+  document.documentElement.style.setProperty('--hud-h', hudH + 'px');
+  document.documentElement.style.setProperty('--bottom-h', bottomH + 'px');
+}
 
 function worldToScreen(wx: number, wy: number) {
   return {
@@ -400,6 +443,47 @@ function screenToWorld(sx: number, sy: number) {
   };
 }
 
+function rebuildOverlay() {
+  if (!overlayImageData || !overlayCtx || !minimapCtx || !minimapCanvas) return;
+  const data = overlayImageData.data;
+  data.fill(0);
+  minimapCtx.fillStyle = '#001122';
+  minimapCtx.fillRect(0, 0, minimapCanvas.width, minimapCanvas.height);
+  const mmScaleX = minimapCanvas.width / VISUAL_W;
+  const mmScaleY = minimapCanvas.height / VISUAL_H;
+
+  for (const chunk of conn.db.tile_chunks.iter()) {
+    if (Number(chunk.matchId) !== currentMatchId) continue;
+    const cx = chunk.chunkX;
+    const cy = chunk.chunkY;
+    for (let ly = 0; ly < CHUNK_SIZE; ly++) {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        const idx = ly * CHUNK_SIZE + lx;
+        const owner = chunk.owners[idx];
+        if (owner === 255) continue;
+        const tx = cx * CHUNK_SIZE + lx;
+        const ty = cy * CHUNK_SIZE + ly;
+        if (tx >= SIM_W || ty >= SIM_H) continue;
+        const color = hex2rgb(COLORS[owner % COLORS.length]);
+        const vx = tx * SCALE;
+        const vy = ty * SCALE;
+        for (let dy = 0; dy < SCALE; dy++) {
+          for (let dx = 0; dx < SCALE; dx++) {
+            const pi = ((vy + dy) * VISUAL_W + (vx + dx)) * 4;
+            data[pi] = color[0];
+            data[pi + 1] = color[1];
+            data[pi + 2] = color[2];
+            data[pi + 3] = 180;
+          }
+        }
+        minimapCtx.fillStyle = COLORS[owner % COLORS.length];
+        minimapCtx.fillRect(tx * mmScaleX, ty * mmScaleY, mmScaleX + 0.5, mmScaleY + 0.5);
+      }
+    }
+  }
+  overlayCtx.putImageData(overlayImageData, 0, 0);
+}
+
 function render() {
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -407,78 +491,33 @@ function render() {
   if (earthImg) {
     const tl = worldToScreen(0, 0);
     const br = worldToScreen(VISUAL_W, VISUAL_H);
-    const w = br.x - tl.x;
-    const h = br.y - tl.y;
-    ctx.drawImage(earthImg, tl.x, tl.y, w, h);
+    ctx.drawImage(earthImg, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
   }
 
-  if (overlayImageData && overlayCtx) {
-    const data = overlayImageData.data;
-    data.fill(0);
+  if (overlayDirty) {
+    rebuildOverlay();
+    overlayDirty = false;
+  }
 
-    for (const chunk of conn.db.tile_chunks.iter()) {
-      if (Number(chunk.matchId) !== currentMatchId) continue;
-      const cx = chunk.chunkX;
-      const cy = chunk.chunkY;
-      for (let ly = 0; ly < CHUNK_SIZE; ly++) {
-        for (let lx = 0; lx < CHUNK_SIZE; lx++) {
-          const tx = cx * CHUNK_SIZE + lx;
-          const ty = cy * CHUNK_SIZE + ly;
-          if (tx >= SIM_W || ty >= SIM_H) continue;
-          const idx = (ly * CHUNK_SIZE + lx);
-          const owner = chunk.owners[idx];
-          if (owner === 255) continue;
-          const color = hex2rgb(COLORS[owner % COLORS.length]);
-          const vx = tx * SCALE;
-          const vy = ty * SCALE;
-          for (let dy = 0; dy < SCALE; dy++) {
-            for (let dx = 0; dx < SCALE; dx++) {
-              const px = vx + dx;
-              const py = vy + dy;
-              const pi = (py * VISUAL_W + px) * 4;
-              data[pi] = color[0];
-              data[pi + 1] = color[1];
-              data[pi + 2] = color[2];
-              data[pi + 3] = 180;
-            }
-          }
-        }
-      }
-    }
-
-    overlayCtx.putImageData(overlayImageData, 0, 0);
+  if (overlayCanvas) {
     const tl = worldToScreen(0, 0);
     const br = worldToScreen(VISUAL_W, VISUAL_H);
-    ctx.drawImage(overlayCanvas!, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+    ctx.drawImage(overlayCanvas, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
   }
 
-  // Minimap
-  mmCtx.fillStyle = '#001122';
-  mmCtx.fillRect(0, 0, minimap.width, minimap.height);
-  const mmScaleX = minimap.width / VISUAL_W;
-  const mmScaleY = minimap.height / VISUAL_H;
-  for (const chunk of conn.db.tile_chunks.iter()) {
-    if (Number(chunk.matchId) !== currentMatchId) continue;
-    for (let ly = 0; ly < CHUNK_SIZE; ly++) {
-      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
-        const idx = (ly * CHUNK_SIZE + lx);
-        const owner = chunk.owners[idx];
-        if (owner === 255) continue;
-        const tx = chunk.chunkX * CHUNK_SIZE + lx;
-        const ty = chunk.chunkY * CHUNK_SIZE + ly;
-        mmCtx.fillStyle = COLORS[owner % COLORS.length];
-        mmCtx.fillRect(tx * mmScaleX, ty * mmScaleY, mmScaleX + 0.5, mmScaleY + 0.5);
-      }
-    }
+  // Minimap: blit cached minimap, then draw viewport rect
+  if (minimapCanvas) {
+    mmCtx.drawImage(minimapCanvas, 0, 0);
+    const mmScaleX = minimap.width / VISUAL_W;
+    const mmScaleY = minimap.height / VISUAL_H;
+    mmCtx.strokeStyle = 'rgba(255,255,255,0.7)';
+    mmCtx.lineWidth = 1;
+    const vpx = view.x / view.scale * mmScaleX;
+    const vpy = view.y / view.scale * mmScaleY;
+    const vpw = canvas.width / view.scale * mmScaleX;
+    const vph = canvas.height / view.scale * mmScaleY;
+    mmCtx.strokeRect(vpx, vpy, vpw, vph);
   }
-  // Viewport rect on minimap
-  mmCtx.strokeStyle = '#fff';
-  mmCtx.lineWidth = 1;
-  const vpx = view.x / view.scale * mmScaleX;
-  const vpy = view.y / view.scale * mmScaleY;
-  const vpw = canvas.width / view.scale * mmScaleX;
-  const vph = canvas.height / view.scale * mmScaleY;
-  mmCtx.strokeRect(vpx, vpy, vpw, vph);
 
   requestAnimationFrame(render);
 }
@@ -492,19 +531,24 @@ function hex2rgb(hex: string): [number, number, number] {
 
 // ── Input ──────────────────────────────────────────────────────────────────────
 let dragging = false;
+let dragMoved = false;
 let dragStart = { x: 0, y: 0 };
 let viewStart = { x: 0, y: 0 };
 
 canvas.addEventListener('mousedown', (e) => {
   dragging = true;
+  dragMoved = false;
   dragStart = { x: e.clientX, y: e.clientY };
   viewStart = { x: view.x, y: view.y };
 });
 
 window.addEventListener('mousemove', (e) => {
   if (dragging) {
-    view.x = viewStart.x - (e.clientX - dragStart.x);
-    view.y = viewStart.y - (e.clientY - dragStart.y);
+    const dx = e.clientX - dragStart.x;
+    const dy = e.clientY - dragStart.y;
+    if (!dragMoved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) dragMoved = true;
+    view.x = viewStart.x - dx;
+    view.y = viewStart.y - dy;
     clampView();
   }
 });
@@ -533,7 +577,7 @@ function clampView() {
 }
 
 canvas.addEventListener('click', (e) => {
-  if (dragging) return;
+  if (dragMoved) { dragMoved = false; return; }
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
@@ -546,7 +590,7 @@ canvas.addEventListener('click', (e) => {
   if (currentMatchId === -1 || myPlayerId === -1) return;
 
   if (currentPhase === PHASE_SPAWN) {
-    conn.reducers.spawn({ matchId: BigInt(currentMatchId), tile });
+    conn.reducers.spawn({ matchId: BigInt(currentMatchId), tile }).catch(reducerErr);
   } else if (currentPhase === PHASE_PLAYING) {
     // Attack: find who owns this tile
     for (const chunk of conn.db.tile_chunks.iter()) {
@@ -559,7 +603,7 @@ canvas.addEventListener('click', (e) => {
       const idx = ly * CHUNK_SIZE + lx;
       const owner = chunk.owners[idx];
       if (owner !== 255 && owner !== myPlayerId) {
-        conn.reducers.launchAttack({ matchId: BigInt(currentMatchId), targetPlayer: owner });
+        conn.reducers.launchAttack({ matchId: BigInt(currentMatchId), targetPlayer: owner }).catch(reducerErr);
       }
       break;
     }
@@ -573,6 +617,7 @@ let touchStartScale = 1;
 canvas.addEventListener('touchstart', (e) => {
   if (e.touches.length === 1) {
     dragging = true;
+    dragMoved = false;
     dragStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
     viewStart = { x: view.x, y: view.y };
   } else if (e.touches.length === 2) {
@@ -586,8 +631,11 @@ canvas.addEventListener('touchstart', (e) => {
 canvas.addEventListener('touchmove', (e) => {
   e.preventDefault();
   if (e.touches.length === 1 && dragging) {
-    view.x = viewStart.x - (e.touches[0].clientX - dragStart.x);
-    view.y = viewStart.y - (e.touches[0].clientY - dragStart.y);
+    const dx = e.touches[0].clientX - dragStart.x;
+    const dy = e.touches[0].clientY - dragStart.y;
+    if (!dragMoved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) dragMoved = true;
+    view.x = viewStart.x - dx;
+    view.y = viewStart.y - dy;
     clampView();
   } else if (e.touches.length === 2) {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
