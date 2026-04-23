@@ -1,4 +1,5 @@
 use spacetimedb::{ReducerContext, Table, Timestamp, Identity, TimeDuration, ScheduleAt};
+use std::collections::HashMap;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const SIM_W: u32 = 1350;
@@ -38,6 +39,10 @@ const DEFAULT_SPEED: u8 = 4;
 
 // Cap on how many frontier tiles per player we persist (oldest overflow spills).
 const FRONTIER_CAP: usize = 4096;
+
+// Cap on how many chunks a single player tracks in `owned_chunks`. The whole
+// world is 946 chunks, so ~1024 is a hard upper bound.
+const OWNED_CHUNKS_CAP: usize = 1024;
 
 // NASA ocean-mask bitfield. 1350×675 bits = 113907 bytes. Baked from the NASA
 // oceanmask PNG by scripts/bake-ocean-mask.mjs. 1 bit = 1 sim tile, row-major;
@@ -87,6 +92,130 @@ fn dist_sq(a: (u32, u32), b: (u32, u32)) -> u32 {
 
 fn rng_seed(match_id: u64, tick: u64, salt: u64) -> u64 {
     match_id.wrapping_mul(6364136223846793005).wrapping_add(tick.wrapping_mul(1442695040888963407)).wrapping_add(salt)
+}
+
+// ── ChunkCache ──────────────────────────────────────────────────────────────
+// Read-through / write-back cache for TileChunk rows, scoped to a single
+// reducer body (usually one `step_match` call). Collapses redundant chunk
+// reads and, crucially, batches tile ownership edits: N set_owner calls into
+// the same chunk produce exactly one DB write at flush time, instead of N
+// full 1024-byte Vec rewrites.
+
+struct ChunkCacheEntry {
+    chunk: TileChunk,
+    dirty: bool,
+}
+
+struct ChunkCache<'a> {
+    ctx: &'a ReducerContext,
+    match_id: u64,
+    entries: HashMap<u64, ChunkCacheEntry>,
+}
+
+impl<'a> ChunkCache<'a> {
+    fn new(ctx: &'a ReducerContext, match_id: u64) -> Self {
+        Self { ctx, match_id, entries: HashMap::new() }
+    }
+
+    fn full_chunk_id(&self, tx: u32, ty: u32) -> Option<u64> {
+        if tx >= SIM_W || ty >= SIM_H { return None; }
+        let cx = tx / CHUNK_SIZE;
+        let cy = ty / CHUNK_SIZE;
+        Some((self.match_id << 32) | (chunk_idx(cx, cy) as u64))
+    }
+
+    // Lazily load a chunk into the cache. Returns None only if the DB has no
+    // such row (should never happen after generate_terrain).
+    fn load(&mut self, chunk_id: u64) -> Option<&mut ChunkCacheEntry> {
+        if !self.entries.contains_key(&chunk_id) {
+            let chunk = self.ctx.db.tile_chunks().id().find(chunk_id)?;
+            self.entries.insert(chunk_id, ChunkCacheEntry { chunk, dirty: false });
+        }
+        self.entries.get_mut(&chunk_id)
+    }
+
+    fn is_land(&mut self, tx: u32, ty: u32) -> bool {
+        let Some(chunk_id) = self.full_chunk_id(tx, ty) else { return false; };
+        let Some(entry) = self.load(chunk_id) else { return false; };
+        let lx = tx % CHUNK_SIZE;
+        let ly = ty % CHUNK_SIZE;
+        let idx = (ly * CHUNK_SIZE + lx) as usize;
+        entry.chunk.terrain.get(idx).copied().unwrap_or(0) == 1
+    }
+
+    fn get_owner(&mut self, tx: u32, ty: u32) -> Option<u32> {
+        let chunk_id = self.full_chunk_id(tx, ty)?;
+        let entry = self.load(chunk_id)?;
+        let lx = tx % CHUNK_SIZE;
+        let ly = ty % CHUNK_SIZE;
+        let idx = (ly * CHUNK_SIZE + lx) as usize;
+        match entry.chunk.owners.get(idx).copied() {
+            Some(255) | None => None,
+            Some(o) => Some(o as u32),
+        }
+    }
+
+    /// Set the tile to `new_owner`. Returns the (chunk_id, previous_owner)
+    /// so callers can maintain `Player.owned_chunks` sets correctly.
+    /// previous_owner = None when the tile was unclaimed.
+    fn set_owner(&mut self, tx: u32, ty: u32, new_owner: u32) -> Option<(u64, Option<u32>)> {
+        let chunk_id = self.full_chunk_id(tx, ty)?;
+        let entry = self.load(chunk_id)?;
+        let lx = tx % CHUNK_SIZE;
+        let ly = ty % CHUNK_SIZE;
+        let idx = (ly * CHUNK_SIZE + lx) as usize;
+        if idx >= entry.chunk.owners.len() { return None; }
+        let prev = entry.chunk.owners[idx];
+        let prev_owner = if prev == 255 { None } else { Some(prev as u32) };
+        if prev as u32 == new_owner { return Some((chunk_id, prev_owner)); }
+        entry.chunk.owners[idx] = new_owner as u8;
+        entry.dirty = true;
+        Some((chunk_id, prev_owner))
+    }
+
+    /// Copy the 1024-byte owners vec for bulk iteration. Avoids borrow
+    /// conflicts when the caller wants to probe neighbour ownership in the
+    /// same chunk via `get_owner`.
+    fn clone_owners(&mut self, chunk_id: u64) -> Option<Vec<u8>> {
+        let entry = self.load(chunk_id)?;
+        Some(entry.chunk.owners.clone())
+    }
+
+    /// Does any tile in this chunk still belong to `owner`? Used by the loser
+    /// side of a flip to decide whether to drop the chunk from its
+    /// `owned_chunks` set.
+    fn chunk_has_owner(&mut self, chunk_id: u64, owner: u32) -> bool {
+        let entry = match self.load(chunk_id) {
+            Some(e) => e,
+            None => return false,
+        };
+        let byte = owner as u8;
+        entry.chunk.owners.iter().any(|&o| o == byte)
+    }
+
+    /// Write every dirty chunk back to the DB exactly once.
+    fn flush(self) {
+        for (_id, entry) in self.entries {
+            if entry.dirty {
+                self.ctx.db.tile_chunks().id().update(entry.chunk);
+            }
+        }
+    }
+}
+
+/// Add `chunk_id` to `player.owned_chunks` if not already present. Bounded.
+fn player_add_chunk(player: &mut Player, chunk_id: u64) {
+    if player.owned_chunks.len() >= OWNED_CHUNKS_CAP { return; }
+    if !player.owned_chunks.contains(&chunk_id) {
+        player.owned_chunks.push(chunk_id);
+    }
+}
+
+/// Remove `chunk_id` from `player.owned_chunks` (no-op if absent).
+fn player_remove_chunk(player: &mut Player, chunk_id: u64) {
+    if let Some(pos) = player.owned_chunks.iter().position(|&c| c == chunk_id) {
+        player.owned_chunks.swap_remove(pos);
+    }
 }
 
 fn rng_next(seed: u64) -> u64 {
@@ -145,6 +274,12 @@ pub struct Player {
     // entries (no longer land / already mine / now enemy-owned); passive
     // expansion filters at pop time.
     frontier_tiles: Vec<u32>,
+    // Chunk ids (full 64-bit form, `match_id<<32 | chunk_idx`) where this
+    // player holds ≥1 tile. Maintained incrementally by ChunkCache::set_owner
+    // on every tile claim and by the loser when a tile flips. Enables
+    // `find_border_tiles` to iterate only the attacker's chunks instead of
+    // the whole 946-chunk world.
+    owned_chunks: Vec<u64>,
 }
 
 #[spacetimedb::table(name = tile_chunks, public)]
@@ -290,6 +425,7 @@ pub fn join_match(ctx: &ReducerContext, match_id: u64, name: String) -> Result<(
         city_count: 0,
         city_levels: 0,
         frontier_tiles: Vec::new(),
+        owned_chunks: Vec::new(),
     };
     ctx.db.players().insert(p);
     Ok(())
@@ -323,6 +459,7 @@ pub fn add_bot(ctx: &ReducerContext, match_id: u64, bot_name: String) -> Result<
         city_count: 0,
         city_levels: 0,
         frontier_tiles: Vec::new(),
+        owned_chunks: Vec::new(),
     };
     ctx.db.players().insert(p);
     Ok(())
@@ -433,6 +570,9 @@ pub fn spawn(ctx: &ReducerContext, match_id: u64, tile: u32) -> Result<(), Strin
     p.tiles = 1;
     p.max_troops = compute_max_troops(1, 0);
     set_owner(ctx, match_id, tx, ty, p.id);
+    if let Some(chunk_id) = spawn_chunk_id(match_id, tx, ty) {
+        player_add_chunk(&mut p, chunk_id);
+    }
     seed_frontier(&mut p, tx, ty);
     ctx.db.players().id().update(p);
     let all_spawned = ctx.db.players().match_id().filter(match_id).all(|p| p.spawn_tile.is_some());
@@ -629,6 +769,10 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
     let match_id = m.id;
     let diff_idx = (m.difficulty as usize).min(2);
 
+    // Per-tick chunk cache. All tile reads/writes below flow through this so
+    // repeated access to the same chunk incurs one DB read and one DB write.
+    let mut cache = ChunkCache::new(ctx, match_id);
+
     // ── 1. Regen troops & passive gold ───────────────────────────────────────
     let players: Vec<_> = ctx.db.players().match_id().filter(match_id).collect();
     for mut p in players {
@@ -663,7 +807,7 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
             continue;
         }
 
-        let border = find_border_tiles(ctx, match_id, attacker.id, target.id);
+        let border = find_border_tiles(&mut cache, &attacker, target.id);
         if border.is_empty() {
             ctx.db.attacks().id().delete(attack.id);
             continue;
@@ -681,7 +825,12 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
                 attacker.troops -= def_str * 0.05;
                 target.troops -= atk_str * 0.04;
                 if target.troops < 1.0 { target.troops = 1.0; }
-                set_owner(ctx, match_id, tx, ty, attacker.id);
+                if let Some((chunk_id, _)) = cache.set_owner(tx, ty, attacker.id) {
+                    player_add_chunk(&mut attacker, chunk_id);
+                    if !cache.chunk_has_owner(chunk_id, target.id) {
+                        player_remove_chunk(&mut target, chunk_id);
+                    }
+                }
                 attacker.tiles += 1;
                 target.tiles -= 1;
                 add_frontier_neighbors(&mut attacker, tx, ty);
@@ -708,21 +857,15 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
     for mut p in active_players {
         let steps = if p.is_bot { DIFF_BOT_EXPAND_STEPS[diff_idx] } else { HUMAN_EXPAND_STEPS };
         let seed = rng_seed(match_id, m.tick, p.id as u64);
-        passive_expand(ctx, match_id, &mut p, steps, seed);
+        passive_expand(&mut cache, ctx, &mut p, steps, seed);
         ctx.db.players().id().update(p);
     }
 
-    // ── 4. Bot directed-attack AI ────────────────────────────────────────────
-    let bot_attackers: Vec<_> = ctx.db.players().match_id().filter(match_id)
-        .filter(|p| p.is_bot && p.alive && p.spawn_tile.is_some())
-        .collect();
-    if m.phase == PHASE_PLAYING {
-        for p in bot_attackers {
-            bot_attack(ctx, match_id, &p);
-        }
-    }
-
-    // ── 5. Auto-spawn bots during SPAWN phase ────────────────────────────────
+    // ── 4. Auto-spawn bots during SPAWN phase ────────────────────────────────
+    // (bot directed-attack AI removed: bots rely entirely on passive expansion,
+    // which already incorporates M0's border-skirmish formula via
+    // `passive_expand`. This eliminates the per-bot full-world
+    // `find_border_tiles` scan that dominated CPU.)
     let unsp_bots: Vec<_> = ctx.db.players().match_id().filter(match_id)
         .filter(|p| p.is_bot && p.alive && p.spawn_tile.is_none())
         .collect();
@@ -735,7 +878,7 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
         }
     }
 
-    // ── 6. Check win ─────────────────────────────────────────────────────────
+    // ── 5. Check win ─────────────────────────────────────────────────────────
     if m.phase == PHASE_PLAYING && m.total_land > 0 {
         let players_check: Vec<_> = ctx.db.players().match_id().filter(match_id).collect();
         for p in players_check {
@@ -750,6 +893,10 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
     }
 
     ctx.db.matches().id().update(m.clone());
+
+    // Write every dirty chunk back to the DB — exactly once per chunk,
+    // regardless of how many tile edits landed on it this tick.
+    cache.flush();
 }
 
 // ── Passive expansion / frontier helpers ────────────────────────────────────
@@ -774,7 +921,7 @@ fn add_frontier_neighbors(p: &mut Player, tx: u32, ty: u32) {
     }
 }
 
-fn passive_expand(ctx: &ReducerContext, match_id: u64, p: &mut Player, steps: u32, seed: u64) {
+fn passive_expand(cache: &mut ChunkCache, ctx: &ReducerContext, p: &mut Player, steps: u32, seed: u64) {
     if p.frontier_tiles.is_empty() { return; }
     let mut s = seed;
     for _ in 0..steps {
@@ -784,12 +931,14 @@ fn passive_expand(ctx: &ReducerContext, match_id: u64, p: &mut Player, steps: u3
         let tile = p.frontier_tiles.swap_remove(ri as usize);
         let tx = tile % SIM_W;
         let ty = tile / SIM_W;
-        if !is_land(ctx, match_id, tx, ty) { continue; }
-        match get_owner(ctx, match_id, tx, ty) {
+        if !cache.is_land(tx, ty) { continue; }
+        match cache.get_owner(tx, ty) {
             Some(o) if o == p.id => continue, // stale — already ours
             None => {
                 // Claim unclaimed land.
-                set_owner(ctx, match_id, tx, ty, p.id);
+                if let Some((chunk_id, _)) = cache.set_owner(tx, ty, p.id) {
+                    player_add_chunk(p, chunk_id);
+                }
                 p.tiles += 1;
                 p.troops = (p.troops - 1.0).max(1.0);
                 add_frontier_neighbors(p, tx, ty);
@@ -807,7 +956,12 @@ fn passive_expand(ctx: &ReducerContext, match_id: u64, p: &mut Player, steps: u3
                     p.troops -= def_str * 0.05;
                     target.troops -= atk_str * 0.04;
                     if target.troops < 1.0 { target.troops = 1.0; }
-                    set_owner(ctx, match_id, tx, ty, p.id);
+                    if let Some((chunk_id, _)) = cache.set_owner(tx, ty, p.id) {
+                        player_add_chunk(p, chunk_id);
+                        if !cache.chunk_has_owner(chunk_id, target.id) {
+                            player_remove_chunk(&mut target, chunk_id);
+                        }
+                    }
                     p.tiles += 1;
                     if target.tiles > 0 { target.tiles -= 1; }
                     add_frontier_neighbors(p, tx, ty);
@@ -869,31 +1023,39 @@ fn set_owner(ctx: &ReducerContext, match_id: u64, tx: u32, ty: u32, owner: u32) 
     }
 }
 
-fn find_border_tiles(ctx: &ReducerContext, match_id: u64, a: u32, b: u32) -> Vec<(u32, u32)> {
+// Find tiles that belong to `attacker` and share a 4-neighbour edge with a tile
+// owned by `target_id`. Iterates only the attacker's `owned_chunks` — a tiny
+// set compared to the 946-chunk world scan the old implementation did.
+fn find_border_tiles(cache: &mut ChunkCache, attacker: &Player, target_id: u32) -> Vec<(u32, u32)> {
     let mut border = Vec::new();
-    for cy in 0..CHUNKS_Y {
-        for cx in 0..CHUNKS_X {
-            let chunk_id = ((match_id as u64) << 32) | (chunk_idx(cx, cy) as u64);
-            if let Some(chunk) = ctx.db.tile_chunks().id().find(chunk_id) {
-                for ly in 0..CHUNK_SIZE {
-                    for lx in 0..CHUNK_SIZE {
-                        let tx = cx * CHUNK_SIZE + lx;
-                        let ty = cy * CHUNK_SIZE + ly;
-                        if tx >= SIM_W || ty >= SIM_H { continue; }
-                        let idx = (ly * CHUNK_SIZE + lx) as usize;
-                        if chunk.owners.get(idx).copied().unwrap_or(255) as u32 != a {
-                            continue;
-                        }
-                        let dirs = [(1i32,0i32), (-1,0), (0,1), (0,-1)];
-                        for (dx, dy) in dirs {
-                            let nx = (tx as i32 + dx) as u32;
-                            let ny = (ty as i32 + dy) as u32;
-                            if nx >= SIM_W || ny >= SIM_H { continue; }
-                            if get_owner(ctx, match_id, nx, ny) == Some(b) {
-                                border.push((tx, ty));
-                                break;
-                            }
-                        }
+    let attacker_byte = attacker.id as u8;
+    // Copy ids first so we can freely call cache methods inside the loop.
+    let chunk_ids: Vec<u64> = attacker.owned_chunks.clone();
+    for chunk_id in chunk_ids {
+        // Clone the 1024-byte owners vec so we can iterate without holding a
+        // mutable reference into the cache (get_owner below needs &mut).
+        let owners = match cache.clone_owners(chunk_id) {
+            Some(o) => o,
+            None => continue,
+        };
+        let local_idx = (chunk_id & 0xFFFF_FFFF) as u32;
+        let cx = local_idx % CHUNKS_X;
+        let cy = local_idx / CHUNKS_X;
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let idx = (ly * CHUNK_SIZE + lx) as usize;
+                if owners.get(idx).copied().unwrap_or(255) != attacker_byte { continue; }
+                let tx = cx * CHUNK_SIZE + lx;
+                let ty = cy * CHUNK_SIZE + ly;
+                if tx >= SIM_W || ty >= SIM_H { continue; }
+                let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+                for (dx, dy) in dirs {
+                    let nx = tx as i32 + dx;
+                    let ny = ty as i32 + dy;
+                    if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
+                    if cache.get_owner(nx as u32, ny as u32) == Some(target_id) {
+                        border.push((tx, ty));
+                        break;
                     }
                 }
             }
@@ -948,44 +1110,20 @@ fn bot_spawn_internal(ctx: &ReducerContext, match_id: u64, player_id: u32, tile:
     p.tiles = 1;
     p.max_troops = compute_max_troops(1, 0);
     set_owner(ctx, match_id, tx, ty, player_id);
+    // Track the spawn tile's chunk so find_border_tiles / passive_expand find it.
+    if let Some(chunk_id) = spawn_chunk_id(match_id, tx, ty) {
+        player_add_chunk(&mut p, chunk_id);
+    }
     seed_frontier(&mut p, tx, ty);
     ctx.db.players().id().update(p);
     Ok(())
 }
 
-fn bot_attack(ctx: &ReducerContext, match_id: u64, p: &Player) {
-    let mut nearest: Option<u32> = None;
-    let mut best_dist = u32::MAX;
-    let (px, py) = match p.spawn_tile {
-        Some(t) => (t % SIM_W, t / SIM_W),
-        None => return,
-    };
-    for other in ctx.db.players().match_id().filter(match_id) {
-        if other.id == p.id || !other.alive { continue; }
-        if let Some(ot) = other.spawn_tile {
-            let ox = ot % SIM_W;
-            let oy = ot / SIM_W;
-            let d = dist_sq((px, py), (ox, oy));
-            if d < best_dist {
-                best_dist = d;
-                nearest = Some(other.id);
-            }
-        }
-    }
-    if let Some(target_id) = nearest {
-        let existing = ctx.db.attacks().match_id().filter(match_id)
-            .find(|a| a.attacker == p.id && a.target == target_id);
-        if existing.is_none() {
-            let commit = p.troops / 20.0;
-            let a = Attack {
-                id: 0,
-                match_id,
-                attacker: p.id,
-                target: target_id,
-                troops_committed: commit,
-                retreating: false,
-            };
-            ctx.db.attacks().insert(a);
-        }
-    }
+// Small helper used by one-shot reducers (spawn, bot_spawn_internal, build_city)
+// that don't use a ChunkCache. Returns the full 64-bit chunk id for a tile.
+fn spawn_chunk_id(match_id: u64, tx: u32, ty: u32) -> Option<u64> {
+    if tx >= SIM_W || ty >= SIM_H { return None; }
+    let cx = tx / CHUNK_SIZE;
+    let cy = ty / CHUNK_SIZE;
+    Some((match_id << 32) | (chunk_idx(cx, cy) as u64))
 }
