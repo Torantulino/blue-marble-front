@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Blue Marble Front — M1 Alpha</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;color:#fff;font-family:'Segoe UI',Arial,sans-serif;overflow:hidden;width:100vw;height:100vh;}
+#canvas{display:block;width:100%;height:100%;cursor:crosshair;}
+body.mode-city #canvas{cursor:cell;}
+#ui{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;}
+.screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:all;background:rgba(0,0,0,0.85);backdrop-filter:blur(6px);}
+.screen.hidden{display:none !important;}
+#startScreen h1{font-size:clamp(2rem,6vw,4rem);font-weight:900;letter-spacing:0.05em;background:linear-gradient(135deg,#4af,#0cf,#4af);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-align:center;margin-bottom:0.3em;}
+#startScreen .sub{font-size:clamp(0.9rem,2vw,1.2rem);color:#8cf;margin-bottom:1.5em;text-align:center;max-width:520px;line-height:1.6;}
+#startScreen .features{display:flex;gap:1.2em;flex-wrap:wrap;justify-content:center;margin-bottom:1.5em;max-width:620px;}
+#startScreen .feat{background:rgba(0,180,255,0.08);border:1px solid rgba(0,180,255,0.25);border-radius:12px;padding:0.9em 1.2em;text-align:center;font-size:0.82rem;color:#adf;flex:0 0 128px;}
+#startScreen .feat .icon{font-size:1.7em;margin-bottom:0.3em;}
+.diff-select{display:flex;gap:0.7em;margin-bottom:1em;}
+.diff-btn{padding:0.5em 1.4em;border-radius:20px;border:1px solid rgba(100,200,255,0.35);background:rgba(0,100,200,0.12);color:#9cf;font-size:0.9rem;cursor:pointer;transition:all 0.15s;pointer-events:all;}
+.diff-btn.active{background:rgba(0,150,255,0.35);border-color:#0af;color:#fff;}
+#howtoScreen .howto-body{text-align:left;line-height:2.1;color:#cdf;font-size:0.92rem;max-width:500px;}
+#howtoScreen .howto-body b{color:#4df;}
+#speedCtrl{display:flex;align-items:center;gap:0.4em;font-size:0.75rem;color:#68a;}
+.speed-btn{min-width:28px;padding:0.25em 0.55em;height:26px;border-radius:13px;border:1px solid rgba(0,180,255,0.3);background:rgba(0,80,180,0.2);color:#9cf;font-size:0.78rem;cursor:pointer;}
+.speed-btn:hover{background:rgba(0,120,255,0.35);}
+.speed-btn.active{background:rgba(0,150,255,0.4);border-color:#0af;color:#fff;}
+#speedLabel{min-width:36px;text-align:center;color:#adf;font-weight:700;}
+.btn{padding:0.85em 2.5em;font-size:1.1rem;font-weight:700;border:none;border-radius:30px;cursor:pointer;letter-spacing:0.05em;transition:all 0.18s;pointer-events:all;margin:0.3em;}
+.btn-primary{background:linear-gradient(135deg,#0af,#07f);color:#fff;box-shadow:0 0 24px rgba(0,170,255,0.4);}
+.btn-primary:hover{transform:scale(1.05);box-shadow:0 0 36px rgba(0,170,255,0.6);}
+.btn-secondary{background:rgba(255,255,255,0.1);color:#cdf;border:1px solid rgba(100,200,255,0.3);}
+.btn-secondary:hover{background:rgba(255,255,255,0.18);}
+.btn-danger{background:rgba(255,60,60,0.2);color:#fcc;border:1px solid rgba(255,100,100,0.4);}
+.btn-danger:hover{background:rgba(255,60,60,0.35);}
+#hud{position:absolute;top:0;left:0;right:0;display:flex;align-items:stretch;background:rgba(0,10,30,0.8);border-bottom:1px solid rgba(0,180,255,0.25);pointer-events:all;z-index:10;}
+#hud.hidden{display:none !important;}
+.hud-panel{padding:0.4em 1em;border-right:1px solid rgba(0,180,255,0.15);display:flex;flex-direction:column;justify-content:center;}
+.hud-label{font-size:0.65rem;color:#68a;text-transform:uppercase;letter-spacing:0.08em;}
+.hud-val{font-size:0.95rem;font-weight:700;color:#4df;}
+.hud-bar-wrap{height:4px;background:rgba(255,255,255,0.1);border-radius:2px;margin-top:3px;min-width:70px;}
+.hud-bar{height:100%;border-radius:2px;background:linear-gradient(90deg,#0af,#06f);transition:width 0.4s;}
+#minimap-wrap{margin-left:auto;padding:0.25em 0.5em;display:flex;align-items:center;}
+#minimap{border:1px solid rgba(0,180,255,0.3);border-radius:3px;image-rendering:pixelated;}
+#bottomBar{position:absolute;bottom:0;left:0;right:0;display:flex;align-items:center;gap:0.5em;padding:0.5em 1em;background:rgba(0,10,30,0.8);border-top:1px solid rgba(0,180,255,0.25);pointer-events:all;z-index:10;}
+#bottomBar.hidden{display:none !important;}
+#status{flex:1;font-size:0.8rem;color:#8cf;}
+#actionBar{display:flex;gap:0.5em;}
+#gameOver{flex-direction:column;gap:1em;}
+#gameOver h2{font-size:clamp(1.8rem,5vw,3rem);font-weight:900;}
+#gameOver .result-detail{color:#9cf;font-size:1rem;text-align:center;line-height:1.7;max-width:420px;}
+#gameOver .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:0.7em 2em;margin:0.5em 0;font-size:0.9rem;}
+#gameOver .stat-item .label{color:#68a;font-size:0.75rem;}
+#gameOver .stat-item .val{color:#4df;font-weight:700;font-size:1rem;}
+#loading{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;z-index:999;pointer-events:all;}
+#loading.hidden{display:none !important;}
+#loading h2{color:#4af;margin-bottom:1em;font-size:1.8rem;}
+#loading .bar-outer{width:300px;height:14px;background:rgba(255,255,255,0.08);border-radius:7px;overflow:hidden;}
+#loading .bar-inner{height:100%;width:0%;background:linear-gradient(90deg,#0af,#07f);border-radius:7px;transition:width 0.25s;}
+#loading .msg{margin-top:0.9em;font-size:0.82rem;color:#68a;text-align:center;max-width:320px;line-height:1.6;}
+#lobbyScreen .lobby-players{display:flex;flex-direction:column;gap:0.5em;margin:1em 0;min-width:280px;}
+#lobbyScreen .lobby-player{display:flex;align-items:center;gap:0.7em;padding:0.5em 1em;background:rgba(0,100,200,0.15);border:1px solid rgba(0,180,255,0.2);border-radius:8px;}
+#lobbyScreen .lobby-player .dot{width:12px;height:12px;border-radius:50%;}
+#lobbyScreen .lobby-player .name{flex:1;font-size:0.9rem;color:#cdf;}
+#lobbyScreen .lobby-player .tag{font-size:0.7rem;color:#8cf;background:rgba(0,180,255,0.15);padding:0.15em 0.5em;border-radius:4px;}
+#matchList{display:flex;flex-direction:column;gap:0.5em;margin:1em 0;min-width:320px;max-height:300px;overflow-y:auto;}
+#matchList .match-row{display:flex;align-items:center;gap:0.7em;padding:0.6em 1em;background:rgba(0,100,200,0.12);border:1px solid rgba(0,180,255,0.2);border-radius:8px;cursor:pointer;transition:all 0.15s;}
+#matchList .match-row:hover{background:rgba(0,150,255,0.2);}
+#matchList .match-row .mname{flex:1;font-size:0.9rem;color:#cdf;}
+#matchList .match-row .mstatus{font-size:0.7rem;color:#8cf;}
+#chatPanel{position:absolute;right:0;top:var(--hud-h,48px);bottom:var(--bottom-h,52px);width:280px;background:rgba(0,10,30,0.85);border-left:1px solid rgba(0,180,255,0.2);display:flex;flex-direction:column;pointer-events:all;z-index:9;}
+#chatPanel.hidden{display:none !important;}
+#chatMessages{flex:1;overflow-y:auto;padding:0.5em;display:flex;flex-direction:column;gap:0.3em;font-size:0.8rem;}
+#chatMessages .chat-msg{color:#cdf;}
+#chatMessages .chat-msg .chat-from{color:#4af;font-weight:700;}
+#chatInputWrap{display:flex;padding:0.5em;border-top:1px solid rgba(0,180,255,0.2);}
+#chatInput{flex:1;background:rgba(0,0,0,0.3);border:1px solid rgba(0,180,255,0.3);color:#fff;padding:0.4em 0.6em;border-radius:4px;font-size:0.8rem;}
+#chatInput:focus{outline:none;border-color:#0af;}
+#chatSend{background:rgba(0,180,255,0.2);border:1px solid rgba(0,180,255,0.3);color:#adf;padding:0.4em 0.8em;border-radius:4px;margin-left:0.3em;cursor:pointer;font-size:0.8rem;}
+</style>
+  <script type="module" crossorigin src="/blue-marble-front/assets/index-0wgTDbQb.js"></script>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <div id="loading">
+    <h2>🌍 Blue Marble Front</h2>
+    <div class="bar-outer"><div class="bar-inner" id="loadBar"></div></div>
+    <div class="msg" id="loadMsg">Connecting to SpacetimeDB…</div>
+  </div>
+
+  <div class="screen hidden" id="startScreen">
+    <h1>🌍 Blue Marble Front</h1>
+    <p class="sub">Global conquest on NASA's real Blue Marble Earth.<br>Claim tiles, grow your forces, own the planet.</p>
+    <div class="features">
+      <div class="feat"><div class="icon">🛰️</div>NASA Blue<br>Marble 5400px</div>
+      <div class="feat"><div class="icon">🗺️</div>1:1 Pixel<br>Tile Grid</div>
+      <div class="feat"><div class="icon">⚔️</div>Territory<br>Expansion</div>
+      <div class="feat"><div class="icon">🤖</div>12 AI<br>Nations</div>
+    </div>
+    <div class="diff-select">
+      <button class="diff-btn" data-d="0">🟢 Easy</button>
+      <button class="diff-btn active" data-d="1">🟡 Normal</button>
+      <button class="diff-btn" data-d="2">🔴 Hard</button>
+    </div>
+    <button class="btn btn-primary" id="btnQuickMatch">⚡ Quick Match</button>
+    <button class="btn btn-secondary" id="btnCreate">➕ Create Match</button>
+    <button class="btn btn-secondary" id="btnList">🌐 Browse Matches</button>
+    <button class="btn btn-secondary" id="btnHowTo">📖 How to Play</button>
+  </div>
+
+  <div class="screen hidden" id="howtoScreen">
+    <h2 style="color:#4af;margin-bottom:1em;font-size:1.5rem;">📖 How to Play</h2>
+    <div class="howto-body">
+      <b>🖱️ Click</b> any land tile to spawn your nation<br>
+      <b>🗺️ Pan</b> drag · <b>🔍 Zoom</b> scroll / pinch<br>
+      <b>⚔️ Troops</b> grow automatically and expand your borders<br>
+      <b>🎯 Attack</b> click an enemy tile to launch a directed attack<br>
+      <b>🏙️ Cities</b> spend gold to raise your troop cap<br>
+      <b>🏆 Win</b> by holding 80% of all land tiles<br>
+      <b>💀 Lose</b> if all your tiles are captured<br>
+      <b>⏩ Speed</b> ½× / 1× / 2× / 4× on the bottom bar
+    </div>
+    <button class="btn btn-primary" id="btnHowToBack" style="margin-top:1.5em;">← Back</button>
+  </div>
+
+  <div class="screen hidden" id="listScreen">
+    <h2 style="color:#4af;margin-bottom:0.5em;">🌐 Open Matches</h2>
+    <div id="matchList"></div>
+    <button class="btn btn-secondary" id="btnBackFromList">← Back</button>
+  </div>
+
+  <div class="screen hidden" id="lobbyScreen">
+    <h2 style="color:#4af;margin-bottom:0.5em;">🚪 Lobby</h2>
+    <div class="lobby-players" id="lobbyPlayers"></div>
+    <button class="btn btn-primary" id="btnStart">▶ Start Match</button>
+    <button class="btn btn-secondary" id="btnAddBot">🤖 Add Bot</button>
+    <button class="btn btn-secondary" id="btnLeave">← Leave</button>
+  </div>
+
+  <div id="hud" class="hidden">
+    <div class="hud-panel"><div class="hud-label">Nation</div><div class="hud-val" id="hudNation">—</div></div>
+    <div class="hud-panel"><div class="hud-label">Tiles</div><div class="hud-val" id="hudTiles">0</div><div class="hud-bar-wrap"><div class="hud-bar" id="hudTilesBar" style="width:0%"></div></div></div>
+    <div class="hud-panel"><div class="hud-label">Troops</div><div class="hud-val" id="hudTroops">0</div><div class="hud-bar-wrap"><div class="hud-bar" id="hudTroopsBar" style="width:0%;background:linear-gradient(90deg,#4f8,#0a4)"></div></div></div>
+    <div class="hud-panel"><div class="hud-label">Gold</div><div class="hud-val" id="hudGold">0</div></div>
+    <div class="hud-panel"><div class="hud-label">Control</div><div class="hud-val" id="hudPct">0%</div></div>
+    <div class="hud-panel"><div class="hud-label">Tick</div><div class="hud-val" id="hudTick">0</div></div>
+    <div id="minimap-wrap"><canvas id="minimap" width="270" height="135"></canvas></div>
+  </div>
+
+  <div id="bottomBar" class="hidden">
+    <div id="status">Click any land tile to spawn!</div>
+    <div id="speedCtrl">
+      <span>Speed:</span>
+      <button class="speed-btn" id="btnSpeed05" data-s="2">½×</button>
+      <button class="speed-btn active" id="btnSpeed1" data-s="4">1×</button>
+      <button class="speed-btn" id="btnSpeed2" data-s="8">2×</button>
+      <button class="speed-btn" id="btnSpeed4" data-s="16">4×</button>
+      <span id="speedLabel">1×</span>
+    </div>
+    <div id="actionBar">
+      <button class="btn btn-secondary" id="btnBuildCity" style="padding:0.5em 1em;font-size:0.8rem;">🏙️ Build City</button>
+      <button class="btn btn-danger" id="btnRetreat" style="padding:0.5em 1em;font-size:0.8rem;">🏳️ Retreat</button>
+      <button class="btn btn-secondary" id="btnChat" style="padding:0.5em 1em;font-size:0.8rem;">💬 Chat</button>
+    </div>
+  </div>
+
+  <div id="chatPanel" class="hidden">
+    <div id="chatMessages"></div>
+    <div id="chatInputWrap">
+      <input type="text" id="chatInput" placeholder="Say something…" maxlength="120">
+      <button id="chatSend">Send</button>
+    </div>
+  </div>
+
+  <div class="screen hidden" id="gameOver">
+    <h2 id="goTitle">—</h2>
+    <div class="result-detail" id="goDetail"></div>
+    <div class="stats-grid" id="goStats"></div>
+    <button class="btn btn-primary" id="replayBtn" style="margin-top:1em;">↺ Play Again</button>
+  </div>
+</div>
+</body>
+</html>
