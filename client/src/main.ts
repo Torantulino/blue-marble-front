@@ -709,6 +709,70 @@ function flushDirtyChunks() {
   dirtyChunks.clear();
 }
 
+// Must match CHUNKS_X in spacetime-module/src/lib.rs.
+const CHUNKS_X_CLIENT = Math.ceil(SIM_W / CHUNK_SIZE);
+
+// Label anchor per-player. Prefer the centroid of owned_chunks (a rough
+// "centre of territory"); fall back to the spawn tile on turn 0 before
+// expansion widens the footprint. Cached on the player row via a WeakMap-ish
+// map keyed by (playerId, ownedChunksLength) so we recompute only when
+// territory changes.
+const labelAnchorCache = new Map<number, { n: number; x: number; y: number }>();
+
+function labelAnchor(p: any): { x: number; y: number } | null {
+  const owned: any[] = p.ownedChunks || [];
+  const id = Number(p.id);
+  const cached = labelAnchorCache.get(id);
+  if (cached && cached.n === owned.length) return { x: cached.x, y: cached.y };
+
+  let ax = 0, ay = 0;
+  if (owned.length > 0) {
+    for (const raw of owned) {
+      // owned_chunks stores u64 as BigInt in the SDK. Lower 32 bits = chunk idx.
+      const localIdx = Number(BigInt(raw) & 0xFFFFFFFFn);
+      ax += (localIdx % CHUNKS_X_CLIENT + 0.5) * CHUNK_SIZE;
+      ay += (Math.floor(localIdx / CHUNKS_X_CLIENT) + 0.5) * CHUNK_SIZE;
+    }
+    ax /= owned.length;
+    ay /= owned.length;
+  } else if (p.spawnTile != null) {
+    const tile = Number(p.spawnTile);
+    ax = (tile % SIM_W) + 0.5;
+    ay = Math.floor(tile / SIM_W) + 0.5;
+  } else {
+    return null;
+  }
+  labelAnchorCache.set(id, { n: owned.length, x: ax, y: ay });
+  return { x: ax, y: ay };
+}
+
+function drawPlayerLabels() {
+  if (currentMatchId === -1) return;
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 13px "Segoe UI", Arial, sans-serif';
+  ctx.lineWidth = 3;
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+
+  for (const p of conn.db.players.iter()) {
+    if (Number(p.matchId) !== currentMatchId) continue;
+    if (!p.alive) continue;
+    if (!p.tiles) continue;
+    const anchor = labelAnchor(p);
+    if (!anchor) continue;
+    const sx = anchor.x * SCALE * view.scale - view.x;
+    const sy = anchor.y * SCALE * view.scale - view.y;
+    if (sx < -80 || sx > canvas.width + 80 || sy < -20 || sy > canvas.height + 20) continue;
+    const label = `${p.name} · ${Number(p.tiles).toLocaleString()}`;
+    ctx.strokeText(label, sx, sy);
+    ctx.fillStyle = COLORS[p.color % COLORS.length];
+    ctx.fillText(label, sx, sy);
+  }
+  ctx.restore();
+}
+
 function render() {
   stepCamera();
   ctx.fillStyle = '#000';
@@ -732,6 +796,8 @@ function render() {
     ctx.drawImage(overlayCanvas, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
     ctx.globalAlpha = 1;
   }
+
+  drawPlayerLabels();
 
   // Minimap: blit cached minimap, then draw viewport rect
   if (minimapCanvas) {
