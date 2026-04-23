@@ -825,15 +825,20 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
                 attacker.troops -= def_str * 0.05;
                 target.troops -= atk_str * 0.04;
                 if target.troops < 1.0 { target.troops = 1.0; }
-                if let Some((chunk_id, _)) = cache.set_owner(tx, ty, attacker.id) {
-                    player_add_chunk(&mut attacker, chunk_id);
-                    if !cache.chunk_has_owner(chunk_id, target.id) {
-                        player_remove_chunk(&mut target, chunk_id);
+                // Flip the tile, but only count the capture if the tile was
+                // genuinely owned by the target. Guards against stale entries
+                // in the border (tile already flipped to someone else this tick).
+                if let Some((chunk_id, prev_owner)) = cache.set_owner(tx, ty, attacker.id) {
+                    if prev_owner == Some(target.id) {
+                        player_add_chunk(&mut attacker, chunk_id);
+                        if !cache.chunk_has_owner(chunk_id, target.id) {
+                            player_remove_chunk(&mut target, chunk_id);
+                        }
+                        attacker.tiles += 1;
+                        if target.tiles > 0 { target.tiles -= 1; }
+                        add_frontier_neighbors(&mut attacker, tx, ty);
                     }
                 }
-                attacker.tiles += 1;
-                target.tiles -= 1;
-                add_frontier_neighbors(&mut attacker, tx, ty);
             } else {
                 attacker.troops -= atk_str * 0.02;
             }
@@ -956,17 +961,21 @@ fn passive_expand(cache: &mut ChunkCache, ctx: &ReducerContext, p: &mut Player, 
                     p.troops -= def_str * 0.05;
                     target.troops -= atk_str * 0.04;
                     if target.troops < 1.0 { target.troops = 1.0; }
-                    if let Some((chunk_id, _)) = cache.set_owner(tx, ty, p.id) {
-                        player_add_chunk(p, chunk_id);
-                        if !cache.chunk_has_owner(chunk_id, target.id) {
-                            player_remove_chunk(&mut target, chunk_id);
+                    // Same prev_owner guard as the directed-attack loop: only
+                    // count the tile if it really was target's.
+                    if let Some((chunk_id, prev_owner)) = cache.set_owner(tx, ty, p.id) {
+                        if prev_owner == Some(target.id) {
+                            player_add_chunk(p, chunk_id);
+                            if !cache.chunk_has_owner(chunk_id, target.id) {
+                                player_remove_chunk(&mut target, chunk_id);
+                            }
+                            p.tiles += 1;
+                            if target.tiles > 0 { target.tiles -= 1; }
+                            add_frontier_neighbors(p, tx, ty);
+                            if target.tiles == 0 {
+                                target.alive = false;
+                            }
                         }
-                    }
-                    p.tiles += 1;
-                    if target.tiles > 0 { target.tiles -= 1; }
-                    add_frontier_neighbors(p, tx, ty);
-                    if target.tiles == 0 {
-                        target.alive = false;
                     }
                 } else {
                     p.troops -= atk_str * 0.02;
@@ -1023,13 +1032,19 @@ fn set_owner(ctx: &ReducerContext, match_id: u64, tx: u32, ty: u32, owner: u32) 
     }
 }
 
-// Find tiles that belong to `attacker` and share a 4-neighbour edge with a tile
-// owned by `target_id`. Iterates only the attacker's `owned_chunks` — a tiny
-// set compared to the 946-chunk world scan the old implementation did.
+// Find tiles owned by `target_id` that sit on the border with `attacker` —
+// i.e. target-owned tiles that have at least one attacker-owned 4-neighbour.
+// These are the tiles that an attack *can actually capture*, so the attack
+// loop's `set_owner(tx, ty, attacker.id)` call is a real flip (not a no-op
+// as it was when this function returned attacker-owned tiles).
+//
+// Iterates only the attacker's `owned_chunks` and their 8 neighbouring chunks
+// — a small set compared to the 946-chunk world scan the original did.
 fn find_border_tiles(cache: &mut ChunkCache, attacker: &Player, target_id: u32) -> Vec<(u32, u32)> {
-    let mut border = Vec::new();
+    let mut border: Vec<(u32, u32)> = Vec::new();
+    let mut seen = std::collections::HashSet::<u32>::new();
     let attacker_byte = attacker.id as u8;
-    // Copy ids first so we can freely call cache methods inside the loop.
+    // Copy ids so we can freely call cache methods inside the loop.
     let chunk_ids: Vec<u64> = attacker.owned_chunks.clone();
     for chunk_id in chunk_ids {
         // Clone the 1024-byte owners vec so we can iterate without holding a
@@ -1053,9 +1068,14 @@ fn find_border_tiles(cache: &mut ChunkCache, attacker: &Player, target_id: u32) 
                     let nx = tx as i32 + dx;
                     let ny = ty as i32 + dy;
                     if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
-                    if cache.get_owner(nx as u32, ny as u32) == Some(target_id) {
-                        border.push((tx, ty));
-                        break;
+                    let nxu = nx as u32;
+                    let nyu = ny as u32;
+                    if cache.get_owner(nxu, nyu) == Some(target_id) {
+                        // Push the TARGET's tile — this is the one that gets flipped.
+                        let key = nyu * SIM_W + nxu;
+                        if seen.insert(key) {
+                            border.push((nxu, nyu));
+                        }
                     }
                 }
             }
