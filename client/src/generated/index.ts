@@ -40,8 +40,10 @@ import BuildCityReducer from "./build_city_reducer";
 import CreateMatchReducer from "./create_match_reducer";
 import JoinMatchReducer from "./join_match_reducer";
 import LaunchAttackReducer from "./launch_attack_reducer";
+import LeaveMatchReducer from "./leave_match_reducer";
 import RetreatAttackReducer from "./retreat_attack_reducer";
 import SendChatReducer from "./send_chat_reducer";
+import SetSpeedReducer from "./set_speed_reducer";
 import SpawnReducer from "./spawn_reducer";
 import StartMatchReducer from "./start_match_reducer";
 
@@ -153,8 +155,10 @@ const reducersSchema = __reducers(
   __reducerSchema("create_match", CreateMatchReducer),
   __reducerSchema("join_match", JoinMatchReducer),
   __reducerSchema("launch_attack", LaunchAttackReducer),
+  __reducerSchema("leave_match", LeaveMatchReducer),
   __reducerSchema("retreat_attack", RetreatAttackReducer),
   __reducerSchema("send_chat", SendChatReducer),
+  __reducerSchema("set_speed", SetSpeedReducer),
   __reducerSchema("spawn", SpawnReducer),
   __reducerSchema("start_match", StartMatchReducer),
 );

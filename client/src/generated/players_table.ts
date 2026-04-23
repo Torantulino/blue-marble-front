@@ -26,4 +26,5 @@ export default __t.row({
   traitorUntil: __t.u64().name("traitor_until"),
   cityCount: __t.u32().name("city_count"),
   cityLevels: __t.u32().name("city_levels"),
+  frontierTiles: __t.array(__t.u32()).name("frontier_tiles"),
 });
