@@ -262,11 +262,12 @@ pub fn add_bot(ctx: &ReducerContext, match_id: u64, bot_name: String) -> Result<
 
 #[spacetimedb::reducer]
 pub fn start_match(ctx: &ReducerContext, match_id: u64) -> Result<(), String> {
-    let mut m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
+    let m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
     if m.phase != PHASE_LOBBY {
         return Err("Already started".to_string());
     }
     generate_terrain(ctx, match_id)?;
+    let mut m = ctx.db.matches().id().find(match_id).ok_or("Match not found")?;
     m.phase = PHASE_SPAWN;
     ctx.db.matches().id().update(m);
     Ok(())
