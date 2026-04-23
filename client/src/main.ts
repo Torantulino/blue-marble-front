@@ -40,7 +40,15 @@ const chunkCanvases = new Map<number, HTMLCanvasElement>();
 // Chunk rows awaiting re-render. Keyed by chunkId so repeated updates dedupe.
 const dirtyChunks = new Map<number, any>();
 let placementMode: 'none' | 'city' = 'none';
-let view = { x: 0, y: 0, scale: 1 };
+// Camera. `view` is what's currently rendered; `targetView` is where we're
+// easing toward. Wheel / pinch / keyboard move the target; render() lerps
+// view → target each frame. During a drag we snap both together so the map
+// tracks the cursor 1:1.
+const view = { x: 0, y: 0, scale: 1 };
+const targetView = { x: 0, y: 0, scale: 1 };
+const ZOOM_STEP = 1.12;   // multiplicative step per wheel notch / key press
+const ZOOM_MAX = 8;
+const CAM_LERP = 0.28;    // higher = snappier, lower = floatier. ~0.28 ≈ 120 ms to settle.
 let gameOver = false;
 let tickN = 0;
 let totalLand = 0;
@@ -140,16 +148,81 @@ async function loadNASAImages() {
   minimapCtx = minimapCanvas.getContext('2d')!;
   minimapCtx.fillStyle = '#001122';
   minimapCtx.fillRect(0, 0, minimapCanvas.width, minimapCanvas.height);
-  fitView();
+  fitView(true); // loading overlay is still up — no need to animate.
 }
 
-function fitView() {
+// Minimum scale = "world fits the viewport". Prevents zooming out further
+// than needed (the earth shrinking below the canvas edge looks weird).
+function minScale(): number {
+  if (!canvas.width || !canvas.height) return 0.1;
+  return Math.min(canvas.width / VISUAL_W, canvas.height / VISUAL_H);
+}
+
+function fitView(instant = false) {
   if (!canvas.width || !canvas.height) return;
-  const scX = canvas.width / VISUAL_W;
-  const scY = canvas.height / VISUAL_H;
-  view.scale = Math.min(scX, scY);
-  view.x = Math.max(0, (VISUAL_W * view.scale - canvas.width) / 2);
-  view.y = Math.max(0, (VISUAL_H * view.scale - canvas.height) / 2);
+  const s = minScale();
+  targetView.scale = s;
+  targetView.x = (VISUAL_W * s - canvas.width) / 2;
+  targetView.y = (VISUAL_H * s - canvas.height) / 2;
+  clampTarget();
+  if (instant) {
+    view.x = targetView.x;
+    view.y = targetView.y;
+    view.scale = targetView.scale;
+  }
+}
+
+// Clamp targetView so the world always fills the viewport (no ocean margins).
+function clampTarget() {
+  const s = Math.max(minScale(), Math.min(ZOOM_MAX, targetView.scale));
+  targetView.scale = s;
+  const dw = VISUAL_W * s;
+  const dh = VISUAL_H * s;
+  if (dw <= canvas.width) targetView.x = (dw - canvas.width) / 2;
+  else targetView.x = Math.max(0, Math.min(dw - canvas.width, targetView.x));
+  if (dh <= canvas.height) targetView.y = (dh - canvas.height) / 2;
+  else targetView.y = Math.max(0, Math.min(dh - canvas.height, targetView.y));
+}
+
+// Ease view → targetView. Called once per rAF by render().
+function stepCamera() {
+  const dx = targetView.x - view.x;
+  const dy = targetView.y - view.y;
+  const ds = targetView.scale - view.scale;
+  // Snap when close enough — avoids infinite tiny drift at floating point tail.
+  if (Math.abs(dx) < 0.25 && Math.abs(dy) < 0.25 && Math.abs(ds) < 0.0005) {
+    view.x = targetView.x;
+    view.y = targetView.y;
+    view.scale = targetView.scale;
+    return;
+  }
+  view.x += dx * CAM_LERP;
+  view.y += dy * CAM_LERP;
+  view.scale += ds * CAM_LERP;
+}
+
+// Zoom around a screen-space pivot (sx, sy). Pivot math preserves the world
+// point under (sx, sy) so it stays pinned under the cursor/pinch centre.
+// All math uses targetView (not view) so rapid wheel events accumulate
+// correctly instead of fighting the in-flight lerp.
+function zoomAt(sx: number, sy: number, factor: number) {
+  const newScale = Math.max(minScale(), Math.min(ZOOM_MAX, targetView.scale * factor));
+  if (newScale === targetView.scale) return;
+  const f = newScale / targetView.scale;
+  targetView.x = (sx + targetView.x) * f - sx;
+  targetView.y = (sy + targetView.y) * f - sy;
+  targetView.scale = newScale;
+  clampTarget();
+}
+
+// Instantly pan the target by (dx, dy) screen pixels. Used by drag — also
+// snaps view so the map tracks the cursor 1:1 with no lerp latency.
+function panBy(dx: number, dy: number) {
+  targetView.x -= dx;
+  targetView.y -= dy;
+  clampTarget();
+  view.x = targetView.x;
+  view.y = targetView.y;
 }
 
 function markChunkDirty(row: any) {
@@ -512,8 +585,9 @@ function resize() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
   if (earthImg) {
-    fitView();
-    clampView();
+    fitView(true); // snap on resize so the map doesn't appear to jump
+  } else {
+    clampTarget();
   }
   syncHudCssVars();
 }
@@ -619,6 +693,7 @@ function flushDirtyChunks() {
 }
 
 function render() {
+  stepCamera();
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -660,25 +735,29 @@ function render() {
 
 // ── Input ──────────────────────────────────────────────────────────────────────
 let dragging = false;
-let dragMoved = false;
-let dragStart = { x: 0, y: 0 };
-let viewStart = { x: 0, y: 0 };
+let dragMoved = false;            // true once total travel exceeds click-vs-drag threshold
+let dragAnchor = { x: 0, y: 0 };  // where mousedown landed (total-distance gate)
+let dragLast = { x: 0, y: 0 };    // last pointer position (per-frame delta)
 
 canvas.addEventListener('mousedown', (e) => {
   dragging = true;
   dragMoved = false;
-  dragStart = { x: e.clientX, y: e.clientY };
-  viewStart = { x: view.x, y: view.y };
+  dragAnchor = { x: e.clientX, y: e.clientY };
+  dragLast = { x: e.clientX, y: e.clientY };
 });
 
 window.addEventListener('mousemove', (e) => {
-  if (dragging) {
-    const dx = e.clientX - dragStart.x;
-    const dy = e.clientY - dragStart.y;
-    if (!dragMoved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) dragMoved = true;
-    view.x = viewStart.x - dx;
-    view.y = viewStart.y - dy;
-    clampView();
+  if (!dragging) return;
+  if (!dragMoved) {
+    const tx = e.clientX - dragAnchor.x;
+    const ty = e.clientY - dragAnchor.y;
+    if (tx * tx + ty * ty > 16) dragMoved = true; // 4px threshold
+  }
+  const dx = e.clientX - dragLast.x;
+  const dy = e.clientY - dragLast.y;
+  if (dx !== 0 || dy !== 0) {
+    panBy(dx, dy);
+    dragLast = { x: e.clientX, y: e.clientY };
   }
 });
 
@@ -686,24 +765,43 @@ window.addEventListener('mouseup', () => { dragging = false; });
 
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  const zoom = e.deltaY > 0 ? 0.9 : 1.1;
-  const oldScale = view.scale;
-  view.scale *= zoom;
-  view.scale = Math.max(0.2, Math.min(5, view.scale));
+  // Pixel-delta mode (trackpads) should step more gently than line-delta mode.
+  const unit = e.deltaMode === 0 ? 100 : 1;
+  const steps = -e.deltaY / unit;
+  const factor = Math.pow(ZOOM_STEP, steps);
   const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  view.x = mx - (mx + view.x) * (view.scale / oldScale);
-  view.y = my - (my + view.y) * (view.scale / oldScale);
-  clampView();
+  zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
 }, { passive: false });
 
-function clampView() {
-  const maxX = VISUAL_W * view.scale - canvas.width;
-  const maxY = VISUAL_H * view.scale - canvas.height;
-  view.x = Math.max(0, Math.min(maxX, view.x));
-  view.y = Math.max(0, Math.min(maxY, view.y));
-}
+// Keyboard: +/- or =/- zoom at viewport centre; 0 or f fits the world;
+// arrow keys pan (if nothing's focused that would consume them).
+window.addEventListener('keydown', (e) => {
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+  const cx = canvas.width / 2;
+  const cy = canvas.height / 2;
+  switch (e.key) {
+    case '+':
+    case '=':
+      zoomAt(cx, cy, ZOOM_STEP);
+      e.preventDefault();
+      break;
+    case '-':
+    case '_':
+      zoomAt(cx, cy, 1 / ZOOM_STEP);
+      e.preventDefault();
+      break;
+    case '0':
+    case 'f':
+    case 'F':
+      fitView();
+      e.preventDefault();
+      break;
+    case 'ArrowLeft':  panBy(60, 0);  e.preventDefault(); break;
+    case 'ArrowRight': panBy(-60, 0); e.preventDefault(); break;
+    case 'ArrowUp':    panBy(0, 60);  e.preventDefault(); break;
+    case 'ArrowDown':  panBy(0, -60); e.preventDefault(); break;
+  }
+});
 
 canvas.addEventListener('click', (e) => {
   if (dragMoved) { dragMoved = false; return; }
@@ -745,44 +843,55 @@ canvas.addEventListener('click', (e) => {
   }
 });
 
-// Touch support
-let touchStartDist = 0;
-let touchStartScale = 1;
+// Touch support. Pan and pinch both pivot around the gesture's own midpoint.
+let pinchLastDist = 0;
 
 canvas.addEventListener('touchstart', (e) => {
   if (e.touches.length === 1) {
     dragging = true;
     dragMoved = false;
-    dragStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-    viewStart = { x: view.x, y: view.y };
+    dragAnchor = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    dragLast = { x: e.touches[0].clientX, y: e.touches[0].clientY };
   } else if (e.touches.length === 2) {
+    dragging = false; // hand over to pinch
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
-    touchStartDist = Math.sqrt(dx * dx + dy * dy);
-    touchStartScale = view.scale;
+    pinchLastDist = Math.sqrt(dx * dx + dy * dy);
   }
+  e.preventDefault();
 }, { passive: false });
 
 canvas.addEventListener('touchmove', (e) => {
   e.preventDefault();
   if (e.touches.length === 1 && dragging) {
-    const dx = e.touches[0].clientX - dragStart.x;
-    const dy = e.touches[0].clientY - dragStart.y;
-    if (!dragMoved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) dragMoved = true;
-    view.x = viewStart.x - dx;
-    view.y = viewStart.y - dy;
-    clampView();
+    if (!dragMoved) {
+      const tx = e.touches[0].clientX - dragAnchor.x;
+      const ty = e.touches[0].clientY - dragAnchor.y;
+      if (tx * tx + ty * ty > 16) dragMoved = true;
+    }
+    const dx = e.touches[0].clientX - dragLast.x;
+    const dy = e.touches[0].clientY - dragLast.y;
+    panBy(dx, dy);
+    dragLast = { x: e.touches[0].clientX, y: e.touches[0].clientY };
   } else if (e.touches.length === 2) {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const zoom = dist / touchStartDist;
-    view.scale = Math.max(0.2, Math.min(5, touchStartScale * zoom));
-    clampView();
+    if (pinchLastDist > 0) {
+      const factor = dist / pinchLastDist;
+      const rect = canvas.getBoundingClientRect();
+      const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+      zoomAt(cx, cy, factor);
+    }
+    pinchLastDist = dist;
   }
 }, { passive: false });
 
-canvas.addEventListener('touchend', () => { dragging = false; });
+canvas.addEventListener('touchend', () => {
+  dragging = false;
+  pinchLastDist = 0;
+});
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 connectStdb();
