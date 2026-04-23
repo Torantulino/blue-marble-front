@@ -8,6 +8,10 @@
     "build:client": "cd client && npm install && npm run build",
     "dev:client": "cd client && npm install && npm run dev",
     "build": "npm run build:module && npm run build:client",
-    "clean": "rm -rf client/node_modules client/dist spacetime-module/target"
+    "clean": "rm -rf client/node_modules client/dist spacetime-module/target",
+    "bake:mask": "node scripts/bake-ocean-mask.mjs"
+  },
+  "devDependencies": {
+    "pngjs": "^7.0.0"
   }
 }

@@ -88,6 +88,14 @@ spacetime build
 spacetime publish --project-path . blue-marble-front
 ```
 
+> The Rust module embeds a pre-baked NASA ocean mask at `spacetime-module/assets/ocean_mask_1350x675.bin` (~114 KB). It's committed to the repo so normal builds work offline. If you ever need to regenerate it (source URL changes, or SIM resolution changes):
+>
+> ```bash
+> node scripts/bake-ocean-mask.mjs
+> ```
+>
+> That fetches the NASA landmask PNG, downsamples to 1350×675, and writes the bitfield. Commit the updated `.bin`.
+
 ### 2. Run the client
 
 ```bash

@@ -249,7 +249,7 @@ function escapeHtml(s: string): string {
 // ── UI event handlers ──────────────────────────────────────────────────────────
 document.getElementById('btnCreate')!.addEventListener('click', () => {
   const name = 'Match ' + Math.floor(Math.random() * 9999);
-  conn.reducers.createMatch({ name }).catch(reducerErr);
+  conn.reducers.createMatch({ name, difficulty: 1 }).catch(reducerErr);
   const check = setInterval(() => {
     if (!myIdentityHex) return;
     for (const m of conn.db.matches.iter()) {

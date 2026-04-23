@@ -12,4 +12,5 @@ import {
 
 export default {
   name: __t.string(),
+  difficulty: __t.u8(),
 };
