@@ -563,15 +563,32 @@ function endGame(won: boolean) {
   hide(bottomBar);
   hide(chatPanel);
   show(gameOverScreen);
-  document.getElementById('goTitle')!.textContent = won ? '🏆 Victory!' : '💀 Defeat';
   const me = Array.from(conn.db.players.iter()).find(p => Number(p.id) === myPlayerId);
   const tiles = me ? me.tiles : 0;
   const pct = totalLand > 0 ? Math.floor((tiles / totalLand) * 100) : 0;
+  const iAmAlive = me ? me.alive : false;
   const aiAlive = Array.from(conn.db.players.iter())
     .filter(p => Number(p.matchId) === currentMatchId && p.isBot && p.alive).length;
-  document.getElementById('goDetail')!.textContent = won
+  // Look up the winning nation's name, if any.
+  const match = Array.from(conn.db.matches.iter()).find(m => Number(m.id) === currentMatchId);
+  const winnerId = match && match.winner != null ? Number(match.winner) : null;
+  const winner = winnerId != null
+    ? Array.from(conn.db.players.iter()).find(p => Number(p.id) === winnerId)
+    : undefined;
+  const winnerName = winner ? winner.name : 'A rival nation';
+
+  const title = won
+    ? '🏆 Victory!'
+    : iAmAlive
+      ? '🏳️ Outplayed'
+      : '💀 Defeat';
+  const detail = won
     ? `You conquered ${pct}% of Earth's land in ${tickN} ticks!`
-    : `You were eliminated after ${tickN} ticks.`;
+    : iAmAlive
+      ? `${winnerName} conquered 80% of Earth first. You held ${tiles.toLocaleString()} tiles (${pct}%) after ${tickN} ticks.`
+      : `You were eliminated by ${winnerName} after ${tickN} ticks.`;
+  document.getElementById('goTitle')!.textContent = title;
+  document.getElementById('goDetail')!.textContent = detail;
   document.getElementById('goStats')!.innerHTML = `
     <div class="stat-item"><div class="label">Ticks</div><div class="val">${tickN}</div></div>
     <div class="stat-item"><div class="label">Tiles held</div><div class="val">${tiles.toLocaleString()}</div></div>
