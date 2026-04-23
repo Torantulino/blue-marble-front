@@ -908,23 +908,34 @@ canvas.addEventListener('click', (e) => {
   if (currentPhase === PHASE_SPAWN) {
     conn.reducers.spawn({ matchId: BigInt(currentMatchId), tile }).catch(reducerErr);
   } else if (currentPhase === PHASE_PLAYING) {
-    // Attack: find who owns this tile
-    for (const chunk of conn.db.tile_chunks.iter()) {
-      if (Number(chunk.matchId) !== currentMatchId) continue;
-      const cx = Math.floor(tx / CHUNK_SIZE);
-      const cy = Math.floor(ty / CHUNK_SIZE);
-      if (chunk.chunkX !== cx || chunk.chunkY !== cy) continue;
-      const lx = tx % CHUNK_SIZE;
-      const ly = ty % CHUNK_SIZE;
-      const idx = ly * CHUNK_SIZE + lx;
-      const owner = chunk.owners[idx];
-      if (owner !== 255 && owner !== myPlayerId) {
-        conn.reducers.launchAttack({ matchId: BigInt(currentMatchId), targetPlayer: owner }).catch(reducerErr);
-      }
-      break;
-    }
+    // OpenFront "click-anywhere-attacks": whatever tile you click becomes the
+    // target. Unclaimed land → wilderness attack (target=0). Own tile → ignore.
+    const owner = ownerOfTile(tx, ty);
+    if (owner === myPlayerId) return;
+    const targetId = owner == null ? 0 : owner;
+    conn.reducers.launchAttack({
+      matchId: BigInt(currentMatchId),
+      targetPlayer: targetId,
+    }).catch(reducerErr);
   }
 });
+
+// Read the owner of (tx, ty) from the subscribed tile_chunks rows. Returns
+// null for unclaimed / ocean / out-of-range. Used by the click handler.
+function ownerOfTile(tx: number, ty: number): number | null {
+  if (tx < 0 || tx >= SIM_W || ty < 0 || ty >= SIM_H) return null;
+  const cx = Math.floor(tx / CHUNK_SIZE);
+  const cy = Math.floor(ty / CHUNK_SIZE);
+  for (const chunk of conn.db.tile_chunks.iter()) {
+    if (Number(chunk.matchId) !== currentMatchId) continue;
+    if (chunk.chunkX !== cx || chunk.chunkY !== cy) continue;
+    const lx = tx % CHUNK_SIZE;
+    const ly = ty % CHUNK_SIZE;
+    const o = chunk.owners[ly * CHUNK_SIZE + lx];
+    return o === 255 ? null : o;
+  }
+  return null;
+}
 
 // Touch support. Pan and pinch both pivot around the gesture's own midpoint.
 let pinchLastDist = 0;

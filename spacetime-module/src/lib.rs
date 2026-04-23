@@ -1,5 +1,6 @@
 use spacetimedb::{ReducerContext, Table, Timestamp, Identity, TimeDuration, ScheduleAt};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const SIM_W: u32 = 1350;
@@ -29,32 +30,74 @@ const PHASE_PLAYING: u8 = 2;
 const PHASE_ENDED: u8 = 3;
 
 // Difficulty (stored on Match.difficulty): 0=Easy, 1=Normal, 2=Hard.
+// Applied to human spawn troops; bot expansion pacing lives in TribeExecution.
 const DIFF_HUMAN_TROOPS_MULT: [f32; 3] = [1.4, 1.0, 0.7];
-const DIFF_BOT_EXPAND_STEPS: [u32; 3] = [30, 50, 75];
-const HUMAN_EXPAND_STEPS: u32 = 40; // Matches M0's stepsForPlayer for the human.
 
 // Speed multiplier (stored on Match.speed_multiplier, quarter-scale):
 // 1=0.25×, 2=0.5×, 4=1×, 8=2×, 16=4×. See sub_tick_count().
 const DEFAULT_SPEED: u8 = 4;
 
-// Cap on how many frontier tiles per player we persist (oldest overflow spills).
-const FRONTIER_CAP: usize = 4096;
-
 // Cap on how many chunks a single player tracks in `owned_chunks`. The whole
 // world is 946 chunks, so ~1024 is a hard upper bound.
 const OWNED_CHUNKS_CAP: usize = 1024;
 
-// NASA ocean-mask bitfield. 1350×675 bits = 113907 bytes. Baked from the NASA
-// oceanmask PNG by scripts/bake-ocean-mask.mjs. 1 bit = 1 sim tile, row-major;
-// 1 = land, 0 = ocean.
-const OCEAN_MASK: &[u8] = include_bytes!("../assets/ocean_mask_1350x675.bin");
+// ── OpenFront-style attack mechanics ────────────────────────────────────────
 
-fn mask_is_land(tx: u32, ty: u32) -> bool {
-    if tx >= SIM_W || ty >= SIM_H { return false; }
-    let bit = ty * SIM_W + tx;
-    let byte = (bit >> 3) as usize;
-    let shift = (bit & 7) as u8;
-    (OCEAN_MASK[byte] >> shift) & 1 == 1
+// Terrain types (stored per tile in TileChunk.terrain).
+// 1/2/3 are used via TERRAIN_MAG / SPEED / ENQUEUE_MAG arrays below.
+const TERRAIN_OCEAN: u8 = 0;
+const _TERRAIN_PLAINS: u8 = 1;
+const _TERRAIN_HIGHLAND: u8 = 2;
+const _TERRAIN_MOUNTAIN: u8 = 3;
+
+// Per-terrain combat weights, ported from OF DefaultConfig.ts attackLogic.
+// Plains: easy/fast. Mountain: hard/slow. Highland: between.
+const TERRAIN_MAG: [f32; 4] = [0.0, 80.0, 100.0, 120.0];
+const TERRAIN_SPEED: [f32; 4] = [0.0, 16.5, 20.0, 25.0];
+const TERRAIN_ENQUEUE_MAG: [f32; 4] = [0.0, 1.0, 1.5, 2.0];
+
+// Retreat refund: player-target attacks lose 25% on retreat; wilderness
+// is refunded in full.
+const RETREAT_MALUS: f32 = 0.25;
+
+// attack_amount(player) = player.troops / divisor.
+const ATTACK_AMOUNT_HUMAN_DIVISOR: f32 = 5.0;
+const ATTACK_AMOUNT_BOT_DIVISOR: f32 = 20.0;
+
+// When a defender drops below this many tiles, mark them eliminated.
+// Full cluster cleanup + tile handoff deferred to a follow-up PR.
+const DEFENDER_DEAD_TILES_THRESH: u32 = 100;
+
+// Large-nation combat modifier pivot. Matches OF's LARGE_TILE_BREAKPOINT.
+const LARGE_TILE_BREAKPOINT: f32 = 100_000.0;
+
+// Defense sigmoid inputs (OF DefaultConfig tunables). A larger midpoint lets
+// smaller nations run longer before the "large defender" debuff kicks in.
+const DEFENSE_DEBUFF_DECAY: f32 = 50_000.0;
+const DEFENSE_DEBUFF_MIDPOINT: f32 = 20_000.0;
+
+// Human-attacks-bot mag modifier (softer combat vs bots).
+const HUMAN_VS_BOT_MAG_MULT: f32 = 0.8;
+
+// Bot AI pacing — a bot issues at most one attack per cooldown window.
+const BOT_ATTACK_COOLDOWN_MIN_TICKS: u64 = 40;
+const BOT_ATTACK_COOLDOWN_MAX_TICKS: u64 = 80;
+
+// Cap on Attack.border and Attack.to_conquer_* to bound persisted row size.
+const ATTACK_HEAP_CAP: usize = 4096;
+
+// Target-id sentinel for wilderness (TerraNullius). Matches OF's TN id = 0.
+const TARGET_WILDERNESS: u32 = 0;
+
+// Terrain byte array. 1350×675 bytes = 911_250 bytes. One byte per tile:
+// 0=ocean, 1=plains, 2=highland, 3=mountain. Baked from the NASA Blue Marble
+// visual by scripts/bake-ocean-mask.mjs (which also consults the ocean mask
+// to decide land vs ocean per tile).
+const TERRAIN: &[u8] = include_bytes!("../assets/terrain_1350x675.bin");
+
+fn mask_terrain(tx: u32, ty: u32) -> u8 {
+    if tx >= SIM_W || ty >= SIM_H { return TERRAIN_OCEAN; }
+    TERRAIN[(ty * SIM_W + tx) as usize]
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -68,15 +111,231 @@ fn tile_to_chunk(tx: u32, ty: u32) -> (u32, u32, u32, u32) {
     (cx, cy, lx, ly)
 }
 
-fn compute_max_troops(tiles: u32, city_levels: u32) -> f32 {
+// Max troops a player can regenerate up to, ported from OF DefaultConfig.
+// Bots get 1/3 of the human curve so they don't snowball unbounded.
+fn compute_max_troops(tiles: u32, city_levels: u32, is_bot: bool) -> f32 {
     let t = tiles as f32;
-    2.0 * (t.powf(0.6) * 1000.0 + 50000.0) + (city_levels as f32) * CITY_TROOP_BONUS
+    let base = 2.0 * (t.powf(0.7) * 1000.0 + 50_000.0)
+             + (city_levels as f32) * CITY_TROOP_BONUS;
+    if is_bot { base / 3.0 } else { base }
 }
 
-fn regen_rate(troops: f32, max_troops: f32) -> f32 {
-    let base = 10.0 + troops.powf(0.73) / 4.0;
-    let taper = 1.0 - (troops / max_troops).min(1.0);
-    base * taper.max(0.0)
+// Per-tick regen. Bots regen 60% as fast as humans.
+fn regen_rate(troops: f32, max_troops: f32, is_bot: bool) -> f32 {
+    let base = 10.0 + troops.powf(0.8) / 4.0;
+    let taper = 1.0 - (troops / max_troops.max(1.0)).min(1.0);
+    let scale = if is_bot { 0.6 } else { 1.0 };
+    base * taper.max(0.0) * scale
+}
+
+// OpenFront's attack_amount: troops committed when an attack is launched.
+fn attack_amount(player: &Player) -> f32 {
+    let divisor = if player.is_bot {
+        ATTACK_AMOUNT_BOT_DIVISOR
+    } else {
+        ATTACK_AMOUNT_HUMAN_DIVISOR
+    };
+    (player.troops / divisor).max(0.0)
+}
+
+// Are the attack's current target and the tile's current owner compatible —
+// i.e. can this attack capture that tile? Wilderness attacks claim unclaimed
+// land; player-target attacks only capture that player's tiles.
+fn is_capturable(target_id: u32, current_owner: Option<u32>) -> bool {
+    match (target_id, current_owner) {
+        (TARGET_WILDERNESS, None) => true,
+        (t, Some(o)) if t != TARGET_WILDERNESS && o == t => true,
+        _ => false,
+    }
+}
+
+fn has_attacker_neighbor(cache: &mut ChunkCache, attacker_id: u32, tx: u32, ty: u32) -> bool {
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+    for (dx, dy) in dirs {
+        let nx = tx as i32 + dx;
+        let ny = ty as i32 + dy;
+        if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
+        if cache.get_owner(nx as u32, ny as u32) == Some(attacker_id) { return true; }
+    }
+    false
+}
+
+fn sigmoid(x: f32, decay: f32, midpoint: f32) -> f32 {
+    let z = (x - midpoint) / decay;
+    1.0 / (1.0 + (-z).exp())
+}
+
+// Outcome of processing a single tile during an attack tick.
+struct AttackStep {
+    attacker_loss: f32,
+    defender_loss: f32,
+    tiles_used: f32,
+}
+
+// Port of OF DefaultConfig.ts attackLogic. Wilderness target takes the simpler
+// branch (no defender_loss, no large-player debuffs). MVP omits defense-post,
+// traitor, and fallout modifiers (they default to 1.0 until those systems
+// exist).
+fn attack_logic(
+    atk_troops: f32,
+    attacker: &Player,
+    target: Option<&Player>,
+    terrain: u8,
+) -> AttackStep {
+    let t_idx = (terrain.min(3)) as usize;
+    let mut mag = TERRAIN_MAG[t_idx];
+    let speed = TERRAIN_SPEED[t_idx];
+    let atk = atk_troops.max(1.0);
+
+    if let Some(t) = target {
+        if !attacker.is_bot && t.is_bot {
+            mag *= HUMAN_VS_BOT_MAG_MULT;
+        }
+        let defense_sig = 1.0 - sigmoid(t.tiles as f32, DEFENSE_DEBUFF_DECAY, DEFENSE_DEBUFF_MIDPOINT);
+        let large_defender_attack_debuff = 0.7 + 0.3 * defense_sig;
+        let large_defender_speed_debuff  = 0.7 + 0.3 * defense_sig;
+        let large_attack_bonus = if attacker.tiles as f32 > LARGE_TILE_BREAKPOINT {
+            (LARGE_TILE_BREAKPOINT / attacker.tiles as f32).powf(0.35)
+        } else { 1.0 };
+        let large_attacker_speed = if attacker.tiles as f32 > LARGE_TILE_BREAKPOINT {
+            (LARGE_TILE_BREAKPOINT / attacker.tiles as f32).powf(0.6)
+        } else { 1.0 };
+        let traitor_mod = 1.0; // Deferred: traitor system.
+        let def_troops = t.troops.max(1.0);
+        let defender_troop_loss = def_troops / (t.tiles.max(1) as f32);
+        let current_attacker_loss = (def_troops / atk).clamp(0.6, 2.0)
+            * mag * 0.8
+            * large_defender_attack_debuff
+            * large_attack_bonus
+            * traitor_mod;
+        let alt_attacker_loss = 1.3 * defender_troop_loss * (mag / 100.0) * traitor_mod;
+        let attacker_loss = 0.4 * current_attacker_loss + 0.6 * alt_attacker_loss;
+        let tiles_used = (def_troops / (5.0 * atk)).clamp(0.2, 1.5)
+            * speed
+            * large_defender_speed_debuff
+            * large_attacker_speed
+            * traitor_mod;
+        AttackStep { attacker_loss, defender_loss: defender_troop_loss, tiles_used }
+    } else {
+        // Wilderness: cheap per-tile, no defender to bleed.
+        let attacker_loss = if attacker.is_bot { mag / 10.0 } else { mag / 5.0 };
+        let tiles_used = (2000.0 * speed.max(10.0) / atk).clamp(5.0, 100.0);
+        AttackStep { attacker_loss, defender_loss: 0.0, tiles_used }
+    }
+}
+
+// Port of OF attackTilesPerTick (DefaultConfig.ts:747).
+fn attack_tiles_per_tick(atk_troops: f32, target: Option<&Player>, num_adjacent: u32) -> f32 {
+    if let Some(t) = target {
+        let def = t.troops.max(1.0);
+        let ratio = (10.0 * atk_troops / def).clamp(0.01, 0.5);
+        ratio * (num_adjacent as f32) * 3.0
+    } else {
+        (num_adjacent as f32) * 2.0
+    }
+}
+
+// Priority for a tile-to-conquer. Lower values pop first (min-heap in step_match).
+// Ports OF's formula in AttackExecution.addNeighbors: tiles with more attacker
+// 4-neighbours already around them are lower priority (pop sooner), mountain
+// terrain is higher priority (pop later = slower advance through mountains).
+fn compute_tile_priority(cache: &mut ChunkCache, attacker_id: u32, tx: u32, ty: u32, current_tick: u64) -> i32 {
+    let terrain = cache.terrain_at(tx, ty);
+    let enqueue_mag = TERRAIN_ENQUEUE_MAG[(terrain.min(3)) as usize];
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+    let mut count = 0;
+    for (dx, dy) in dirs {
+        let nx = tx as i32 + dx;
+        let ny = ty as i32 + dy;
+        if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
+        if cache.get_owner(nx as u32, ny as u32) == Some(attacker_id) { count += 1; }
+    }
+    // Deterministic jitter so refreshes yield stable priorities per tile.
+    let seed = rng_seed(tx as u64, ty as u64, current_tick);
+    let base = ((seed % 7) as f32) + 10.0;
+    let priority = base * (1.0 - 0.5 * count as f32 + enqueue_mag / 2.0) + current_tick as f32;
+    priority as i32
+}
+
+// After a tile is claimed during an attack, enqueue its target-capturable
+// 4-neighbours (land + owner matches target). Returns (tile, priority) pairs.
+fn enqueue_tile_neighbors(
+    cache: &mut ChunkCache,
+    attacker_id: u32,
+    target_id: u32,
+    tx: u32,
+    ty: u32,
+    current_tick: u64,
+) -> Vec<(u32, i32)> {
+    let mut out = Vec::new();
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+    for (dx, dy) in dirs {
+        let nx = tx as i32 + dx;
+        let ny = ty as i32 + dy;
+        if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
+        let nxu = nx as u32;
+        let nyu = ny as u32;
+        if !cache.is_land(nxu, nyu) { continue; }
+        let owner = cache.get_owner(nxu, nyu);
+        if !is_capturable(target_id, owner) { continue; }
+        let prio = compute_tile_priority(cache, attacker_id, nxu, nyu, current_tick);
+        out.push((nyu * SIM_W + nxu, prio));
+    }
+    out
+}
+
+// Scan the attacker's owned_chunks for capturable 4-neighbours. Returns the
+// deduped border set and the initial heap entries.
+fn seed_attack_border(
+    cache: &mut ChunkCache,
+    attacker: &Player,
+    target_id: u32,
+    _source_tile: Option<u32>, // MVP: always None
+    current_tick: u64,
+) -> (Vec<u32>, Vec<(u32, i32)>) {
+    let mut border_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut heap: Vec<(u32, i32)> = Vec::new();
+    let attacker_byte = attacker.id as u8;
+    let chunk_ids: Vec<u64> = attacker.owned_chunks.clone();
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+
+    'outer: for chunk_id in chunk_ids {
+        let owners = match cache.clone_owners(chunk_id) {
+            Some(o) => o,
+            None => continue,
+        };
+        let local_idx = (chunk_id & 0xFFFF_FFFF) as u32;
+        let cx = local_idx % CHUNKS_X;
+        let cy = local_idx / CHUNKS_X;
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let idx = (ly * CHUNK_SIZE + lx) as usize;
+                if owners.get(idx).copied().unwrap_or(255) != attacker_byte { continue; }
+                let tx = cx * CHUNK_SIZE + lx;
+                let ty = cy * CHUNK_SIZE + ly;
+                if tx >= SIM_W || ty >= SIM_H { continue; }
+                for (dx, dy) in dirs {
+                    let nx = tx as i32 + dx;
+                    let ny = ty as i32 + dy;
+                    if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
+                    let nxu = nx as u32;
+                    let nyu = ny as u32;
+                    if !cache.is_land(nxu, nyu) { continue; }
+                    let owner = cache.get_owner(nxu, nyu);
+                    if !is_capturable(target_id, owner) { continue; }
+                    let key = nyu * SIM_W + nxu;
+                    if border_set.insert(key) {
+                        let prio = compute_tile_priority(cache, attacker.id, nxu, nyu, current_tick);
+                        heap.push((key, prio));
+                        if heap.len() >= ATTACK_HEAP_CAP { break 'outer; }
+                    }
+                }
+            }
+        }
+    }
+
+    let border: Vec<u32> = border_set.into_iter().collect();
+    (border, heap)
 }
 
 fn city_cost(nth: u32) -> f32 {
@@ -135,12 +394,16 @@ impl<'a> ChunkCache<'a> {
     }
 
     fn is_land(&mut self, tx: u32, ty: u32) -> bool {
-        let Some(chunk_id) = self.full_chunk_id(tx, ty) else { return false; };
-        let Some(entry) = self.load(chunk_id) else { return false; };
+        self.terrain_at(tx, ty) != TERRAIN_OCEAN
+    }
+
+    fn terrain_at(&mut self, tx: u32, ty: u32) -> u8 {
+        let Some(chunk_id) = self.full_chunk_id(tx, ty) else { return TERRAIN_OCEAN; };
+        let Some(entry) = self.load(chunk_id) else { return TERRAIN_OCEAN; };
         let lx = tx % CHUNK_SIZE;
         let ly = ty % CHUNK_SIZE;
         let idx = (ly * CHUNK_SIZE + lx) as usize;
-        entry.chunk.terrain.get(idx).copied().unwrap_or(0) == 1
+        entry.chunk.terrain.get(idx).copied().unwrap_or(TERRAIN_OCEAN)
     }
 
     fn get_owner(&mut self, tx: u32, ty: u32) -> Option<u32> {
@@ -269,17 +532,15 @@ pub struct Player {
     traitor_until: u64,
     city_count: u32,
     city_levels: u32,
-    // Tiles adjacent to our territory waiting to be claimed or contested.
-    // Row-major tile indices. Capped at FRONTIER_CAP. May contain stale
-    // entries (no longer land / already mine / now enemy-owned); passive
-    // expansion filters at pop time.
-    frontier_tiles: Vec<u32>,
     // Chunk ids (full 64-bit form, `match_id<<32 | chunk_idx`) where this
     // player holds ≥1 tile. Maintained incrementally by ChunkCache::set_owner
-    // on every tile claim and by the loser when a tile flips. Enables
-    // `find_border_tiles` to iterate only the attacker's chunks instead of
+    // on every tile claim and by the loser when a tile flips. Used by
+    // `seed_attack_border` to find target-adjacent tiles without scanning
     // the whole 946-chunk world.
     owned_chunks: Vec<u64>,
+    // Tick at which this player (really: bot) may issue its next attack.
+    // Used by the simple bot AI to pace aggression. 0 = no pending cooldown.
+    next_attack_tick: u64,
 }
 
 #[spacetimedb::table(name = tile_chunks, public)]
@@ -292,7 +553,7 @@ pub struct TileChunk {
     chunk_x: u16,
     chunk_y: u16,
     owners: Vec<u8>,   // 255 = unclaimed/ocean
-    terrain: Vec<u8>,  // 1 = land, 0 = ocean
+    terrain: Vec<u8>,  // 0=ocean, 1=plains, 2=highland, 3=mountain
 }
 
 #[spacetimedb::table(name = attacks, public)]
@@ -304,9 +565,29 @@ pub struct Attack {
     #[index(btree)]
     match_id: u64,
     attacker: u32,
+    // Target player id. 0 = wilderness (TerraNullius, per OpenFront).
     target: u32,
-    troops_committed: f32,
+    // Live troop pool held by the attack. At launch this is deducted from
+    // the attacker; each captured tile drains it via attack_logic. Retreat
+    // refunds the remainder (minus RETREAT_MALUS for player targets).
+    troops: f32,
+    // Two-step retreat flag. retreat_attack sets this; step_match refunds
+    // survivors + deletes the row next tick.
     retreating: bool,
+    // Tiles owned by `target` that sit adjacent to an attacker tile. Kept
+    // in sync by the conquest loop as new borders open up.
+    border: Vec<u32>,
+    // Parallel arrays that serialise a min-heap of tiles-to-conquer: lowest
+    // priority value pops first. Reconstructed into a std BinaryHeap at
+    // tick start and dumped back at tick end.
+    to_conquer_tiles: Vec<u32>,
+    to_conquer_priorities: Vec<i32>,
+    // Starting tile for amphibious / boat attacks. None for ground attacks.
+    // Reserved — unused in the MVP port.
+    source_tile: Option<u32>,
+    // Tick of the last border+heap refresh. Used to force a rebuild when
+    // stale entries dominate.
+    last_refresh_tick: u64,
 }
 
 #[spacetimedb::table(name = cities, public)]
@@ -390,7 +671,6 @@ pub fn leave_match(ctx: &ReducerContext, match_id: u64) -> Result<(), String> {
             let mut me = me;
             me.alive = false;
             me.troops = 0.0;
-            me.frontier_tiles.clear();
             ctx.db.players().id().update(me);
         }
     }
@@ -424,8 +704,8 @@ pub fn join_match(ctx: &ReducerContext, match_id: u64, name: String) -> Result<(
         traitor_until: 0,
         city_count: 0,
         city_levels: 0,
-        frontier_tiles: Vec::new(),
         owned_chunks: Vec::new(),
+        next_attack_tick: 0,
     };
     ctx.db.players().insert(p);
     Ok(())
@@ -458,8 +738,8 @@ pub fn add_bot(ctx: &ReducerContext, match_id: u64, bot_name: String) -> Result<
         traitor_until: 0,
         city_count: 0,
         city_levels: 0,
-        frontier_tiles: Vec::new(),
         owned_chunks: Vec::new(),
+        next_attack_tick: 0,
     };
     ctx.db.players().insert(p);
     Ok(())
@@ -507,10 +787,13 @@ fn generate_terrain(ctx: &ReducerContext, match_id: u64) -> Result<(), String> {
                 for lx in 0..CHUNK_SIZE {
                     let tx = cx * CHUNK_SIZE + lx;
                     let ty = cy * CHUNK_SIZE + ly;
-                    let is_land = mask_is_land(tx, ty);
-                    terrain.push(if is_land { 1 } else { 0 });
+                    // mask_terrain returns 0=ocean, 1=plains, 2=highland, 3=mountain.
+                    // The ocean-mask bitfield and the terrain bitfield are baked from
+                    // the same source and agree on which tiles are land.
+                    let terrain_id = mask_terrain(tx, ty);
+                    terrain.push(terrain_id);
                     owners.push(255);
-                    if is_land {
+                    if terrain_id != TERRAIN_OCEAN {
                         total_land += 1;
                     }
                 }
@@ -568,12 +851,11 @@ pub fn spawn(ctx: &ReducerContext, match_id: u64, tile: u32) -> Result<(), Strin
     };
     p.gold = 0.0;
     p.tiles = 1;
-    p.max_troops = compute_max_troops(1, 0);
+    p.max_troops = compute_max_troops(1, 0, p.is_bot);
     set_owner(ctx, match_id, tx, ty, p.id);
     if let Some(chunk_id) = spawn_chunk_id(match_id, tx, ty) {
         player_add_chunk(&mut p, chunk_id);
     }
-    seed_frontier(&mut p, tx, ty);
     ctx.db.players().id().update(p);
     let all_spawned = ctx.db.players().match_id().filter(match_id).all(|p| p.spawn_tile.is_some());
     if all_spawned {
@@ -601,7 +883,7 @@ pub fn bot_spawn(ctx: &ReducerContext, match_id: u64, player_id: u32, tile: u32)
     p.troops = START_TROOPS_BOT;
     p.gold = 0.0;
     p.tiles = 1;
-    p.max_troops = compute_max_troops(1, 0);
+    p.max_troops = compute_max_troops(1, 0, p.is_bot);
     set_owner(ctx, match_id, tx, ty, player_id);
     ctx.db.players().id().update(p);
     Ok(())
@@ -613,32 +895,100 @@ pub fn launch_attack(ctx: &ReducerContext, match_id: u64, target_player: u32) ->
     if m.phase != PHASE_PLAYING {
         return Err("Match not in play".to_string());
     }
-    let attacker = ctx.db.players()
+    let attacker_id = ctx.db.players()
         .match_id().filter(match_id)
         .find(|p| p.identity == ctx.sender && !p.is_bot)
-        .ok_or("Not in match")?;
-    if !attacker.alive {
-        return Err("Eliminated".to_string());
+        .ok_or("Not in match")?
+        .id;
+    let mut cache = ChunkCache::new(ctx, match_id);
+    let result = launch_attack_internal(ctx, &mut cache, match_id, attacker_id, target_player, m.tick);
+    cache.flush();
+    result
+}
+
+// Shared core used by both the public reducer and bot AI. Ports OpenFront
+// AttackExecution.init (AttackExecution.ts:100-169).
+fn launch_attack_internal(
+    ctx: &ReducerContext,
+    cache: &mut ChunkCache,
+    match_id: u64,
+    attacker_id: u32,
+    target_player: u32,
+    current_tick: u64,
+) -> Result<(), String> {
+    if attacker_id == target_player { return Err("Cannot attack yourself".to_string()); }
+    let mut attacker = ctx.db.players().id().find(attacker_id).ok_or("Attacker not found")?;
+    if !attacker.alive { return Err("Eliminated".to_string()); }
+    if attacker.spawn_tile.is_none() { return Err("Not yet spawned".to_string()); }
+
+    if target_player != TARGET_WILDERNESS {
+        let target = ctx.db.players().id().find(target_player).ok_or("Target not found")?;
+        if target.match_id != match_id { return Err("Target not in match".to_string()); }
+        if !target.alive { return Err("Target is dead".to_string()); }
     }
-    let target = ctx.db.players().id().find(target_player).ok_or("Target not found")?;
-    if target.match_id != match_id || !target.alive {
-        return Err("Invalid target".to_string());
+
+    let start = attack_amount(&attacker);
+    if start < 1.0 { return Err("Not enough troops".to_string()); }
+    attacker.troops -= start;
+    ctx.db.players().id().update(attacker.clone());
+
+    // Cancel-out: opposing attack from our target on us. Only meaningful for
+    // player targets; wilderness has no attacks of its own.
+    let mut my_pool = start;
+    if target_player != TARGET_WILDERNESS {
+        let opposing: Vec<_> = ctx.db.attacks().match_id().filter(match_id)
+            .filter(|a| a.attacker == target_player && a.target == attacker_id && !a.retreating)
+            .collect();
+        for opp in opposing {
+            if opp.troops > my_pool {
+                let mut opp = opp;
+                opp.troops -= my_pool;
+                ctx.db.attacks().id().update(opp);
+                return Ok(()); // fully absorbed, no new row
+            } else {
+                my_pool -= opp.troops;
+                ctx.db.attacks().id().delete(opp.id);
+                if my_pool < 1.0 { return Ok(()); }
+            }
+        }
     }
-    let existing = ctx.db.attacks().match_id().filter(match_id)
-        .find(|a| a.attacker == attacker.id && a.target == target_player);
-    if existing.is_some() {
-        return Err("Attack already active".to_string());
+
+    // Merge with our existing attack on same target (§3d).
+    let mine = ctx.db.attacks().match_id().filter(match_id)
+        .find(|a| a.attacker == attacker_id && a.target == target_player && !a.retreating);
+    if let Some(existing) = mine {
+        let mut e = existing;
+        e.troops += my_pool;
+        ctx.db.attacks().id().update(e);
+        return Ok(());
     }
-    let commit = attacker.troops / 5.0;
-    let a = Attack {
+
+    // Fresh attack. Seed border + heap from attacker's owned_chunks.
+    let (border, heap_entries) = seed_attack_border(
+        cache, &attacker, target_player, None, current_tick);
+    if border.is_empty() {
+        // Nothing to attack — refund and bail.
+        attacker.troops += my_pool;
+        ctx.db.players().id().update(attacker);
+        return Err(
+            if target_player == TARGET_WILDERNESS { "No bordering wilderness" }
+            else { "No border with target" }.to_string());
+    }
+    let (to_conquer_tiles, to_conquer_priorities): (Vec<u32>, Vec<i32>) =
+        heap_entries.into_iter().unzip();
+    ctx.db.attacks().insert(Attack {
         id: 0,
         match_id,
-        attacker: attacker.id,
+        attacker: attacker_id,
         target: target_player,
-        troops_committed: commit,
+        troops: my_pool,
         retreating: false,
-    };
-    ctx.db.attacks().insert(a);
+        border,
+        to_conquer_tiles,
+        to_conquer_priorities,
+        source_tile: None,
+        last_refresh_tick: current_tick,
+    });
     Ok(())
 }
 
@@ -649,9 +999,11 @@ pub fn retreat_attack(ctx: &ReducerContext, match_id: u64, target_player: u32) -
         .find(|p| p.identity == ctx.sender && !p.is_bot)
         .ok_or("Not in match")?;
     let attack = ctx.db.attacks().match_id().filter(match_id)
-        .find(|a| a.attacker == attacker.id && a.target == target_player)
+        .find(|a| a.attacker == attacker.id && a.target == target_player && !a.retreating)
         .ok_or("No active attack")?;
-    ctx.db.attacks().id().delete(attack.id);
+    let mut attack = attack;
+    attack.retreating = true;
+    ctx.db.attacks().id().update(attack);
     Ok(())
 }
 
@@ -687,7 +1039,7 @@ pub fn build_city(ctx: &ReducerContext, match_id: u64, tile: u32) -> Result<(), 
     p.gold -= cost;
     p.city_count += 1;
     p.city_levels += 1;
-    p.max_troops = compute_max_troops(p.tiles, p.city_levels);
+    p.max_troops = compute_max_troops(p.tiles, p.city_levels, p.is_bot);
     ctx.db.players().id().update(p);
     let city = City {
         id: 0,
@@ -767,7 +1119,6 @@ fn sub_tick_count(m: &mut Match) -> u32 {
 fn step_match(ctx: &ReducerContext, m: &mut Match) {
     m.tick += 1;
     let match_id = m.id;
-    let diff_idx = (m.difficulty as usize).min(2);
 
     // Per-tick chunk cache. All tile reads/writes below flow through this so
     // repeated access to the same chunk incurs one DB read and one DB write.
@@ -779,98 +1130,26 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
         if !p.alive || p.spawn_tile.is_none() {
             continue;
         }
-        p.max_troops = compute_max_troops(p.tiles, p.city_levels);
-        let regen = regen_rate(p.troops, p.max_troops);
+        p.max_troops = compute_max_troops(p.tiles, p.city_levels, p.is_bot);
+        let regen = regen_rate(p.troops, p.max_troops, p.is_bot);
         p.troops = (p.troops + regen).min(p.max_troops);
         let gold_income = if p.is_bot { GOLD_PER_TICK_BOT } else { GOLD_PER_TICK_HUMAN };
         p.gold += gold_income;
         ctx.db.players().id().update(p);
     }
 
-    // ── 2. Directed attacks ──────────────────────────────────────────────────
+    // ── 2. Attack tick: heap-based conquest + retreat refund ─────────────────
     let attacks: Vec<_> = ctx.db.attacks().match_id().filter(match_id).collect();
     for attack in attacks {
-        if attack.retreating {
-            ctx.db.attacks().id().delete(attack.id);
-            continue;
-        }
-        let mut attacker = match ctx.db.players().id().find(attack.attacker) {
-            Some(p) => p,
-            None => { ctx.db.attacks().id().delete(attack.id); continue; }
-        };
-        let mut target = match ctx.db.players().id().find(attack.target) {
-            Some(p) => p,
-            None => { ctx.db.attacks().id().delete(attack.id); continue; }
-        };
-        if !attacker.alive || !target.alive {
-            ctx.db.attacks().id().delete(attack.id);
-            continue;
-        }
-
-        let border = find_border_tiles(&mut cache, &attacker, target.id);
-        if border.is_empty() {
-            ctx.db.attacks().id().delete(attack.id);
-            continue;
-        }
-
-        let atk_str = attack.troops_committed * 0.25;
-        let def_str = target.troops * 0.3;
-        let max_take = ((border.len() as f32) * 0.3).ceil() as usize;
-
-        for (tx, ty) in border.into_iter().take(max_take) {
-            if attacker.troops < 10.0 || target.troops < 1.0 {
-                break;
-            }
-            if atk_str > def_str + 10.0 {
-                attacker.troops -= def_str * 0.05;
-                target.troops -= atk_str * 0.04;
-                if target.troops < 1.0 { target.troops = 1.0; }
-                // Flip the tile, but only count the capture if the tile was
-                // genuinely owned by the target. Guards against stale entries
-                // in the border (tile already flipped to someone else this tick).
-                if let Some((chunk_id, prev_owner)) = cache.set_owner(tx, ty, attacker.id) {
-                    if prev_owner == Some(target.id) {
-                        player_add_chunk(&mut attacker, chunk_id);
-                        if !cache.chunk_has_owner(chunk_id, target.id) {
-                            player_remove_chunk(&mut target, chunk_id);
-                        }
-                        attacker.tiles += 1;
-                        if target.tiles > 0 { target.tiles -= 1; }
-                        add_frontier_neighbors(&mut attacker, tx, ty);
-                    }
-                }
-            } else {
-                attacker.troops -= atk_str * 0.02;
-            }
-            if attacker.troops < 10.0 { break; }
-        }
-
-        ctx.db.players().id().update(attacker.clone());
-        ctx.db.players().id().update(target.clone());
-
-        if target.tiles == 0 {
-            target.alive = false;
-            ctx.db.players().id().update(target);
-            ctx.db.attacks().id().delete(attack.id);
-        }
+        process_attack(ctx, &mut cache, match_id, m.tick, attack);
     }
 
-    // ── 3. Passive expansion for every alive player (human and bot) ──────────
-    let active_players: Vec<_> = ctx.db.players().match_id().filter(match_id)
-        .filter(|p| p.alive && p.spawn_tile.is_some())
-        .collect();
-    for mut p in active_players {
-        let steps = if p.is_bot { DIFF_BOT_EXPAND_STEPS[diff_idx] } else { HUMAN_EXPAND_STEPS };
-        let seed = rng_seed(match_id, m.tick, p.id as u64);
-        passive_expand(&mut cache, ctx, &mut p, steps, seed);
-        ctx.db.players().id().update(p);
+    // ── 3. Bot AI — issue periodic attacks on cooldown ───────────────────────
+    if m.phase == PHASE_PLAYING {
+        bot_ai_tick(ctx, &mut cache, match_id, m.tick);
     }
 
     // ── 4. Auto-spawn bots during SPAWN phase ────────────────────────────────
-    // (bot directed-attack AI removed: bots rely entirely on passive expansion,
-    // which already incorporates M0's border-skirmish formula via
-    // `passive_expand`. This eliminates the per-bot full-world
-    // `find_border_tiles` scan that dominated CPU.)
     let unsp_bots: Vec<_> = ctx.db.players().match_id().filter(match_id)
         .filter(|p| p.is_bot && p.alive && p.spawn_tile.is_none())
         .collect();
@@ -904,90 +1183,6 @@ fn step_match(ctx: &ReducerContext, m: &mut Match) {
     cache.flush();
 }
 
-// ── Passive expansion / frontier helpers ────────────────────────────────────
-
-fn seed_frontier(p: &mut Player, tx: u32, ty: u32) {
-    p.frontier_tiles.clear();
-    add_frontier_neighbors(p, tx, ty);
-}
-
-fn add_frontier_neighbors(p: &mut Player, tx: u32, ty: u32) {
-    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
-    for (dx, dy) in dirs {
-        let nx = tx as i32 + dx;
-        let ny = ty as i32 + dy;
-        if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
-        let nxu = nx as u32;
-        let nyu = ny as u32;
-        if !mask_is_land(nxu, nyu) { continue; }
-        let nidx = nyu * SIM_W + nxu;
-        if p.frontier_tiles.len() >= FRONTIER_CAP { continue; }
-        p.frontier_tiles.push(nidx);
-    }
-}
-
-fn passive_expand(cache: &mut ChunkCache, ctx: &ReducerContext, p: &mut Player, steps: u32, seed: u64) {
-    if p.frontier_tiles.is_empty() { return; }
-    let mut s = seed;
-    for _ in 0..steps {
-        if p.frontier_tiles.is_empty() { break; }
-        let (ns, ri) = rng_range(s, p.frontier_tiles.len() as u32);
-        s = ns;
-        let tile = p.frontier_tiles.swap_remove(ri as usize);
-        let tx = tile % SIM_W;
-        let ty = tile / SIM_W;
-        if !cache.is_land(tx, ty) { continue; }
-        match cache.get_owner(tx, ty) {
-            Some(o) if o == p.id => continue, // stale — already ours
-            None => {
-                // Claim unclaimed land.
-                if let Some((chunk_id, _)) = cache.set_owner(tx, ty, p.id) {
-                    player_add_chunk(p, chunk_id);
-                }
-                p.tiles += 1;
-                p.troops = (p.troops - 1.0).max(1.0);
-                add_frontier_neighbors(p, tx, ty);
-            }
-            Some(target_id) => {
-                // Border skirmish with adjacent enemy tile.
-                let mut target = match ctx.db.players().id().find(target_id) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                if !target.alive { continue; }
-                let atk_str = p.troops * 0.25;
-                let def_str = target.troops * 0.3;
-                if atk_str > def_str + 10.0 {
-                    p.troops -= def_str * 0.05;
-                    target.troops -= atk_str * 0.04;
-                    if target.troops < 1.0 { target.troops = 1.0; }
-                    // Same prev_owner guard as the directed-attack loop: only
-                    // count the tile if it really was target's.
-                    if let Some((chunk_id, prev_owner)) = cache.set_owner(tx, ty, p.id) {
-                        if prev_owner == Some(target.id) {
-                            player_add_chunk(p, chunk_id);
-                            if !cache.chunk_has_owner(chunk_id, target.id) {
-                                player_remove_chunk(&mut target, chunk_id);
-                            }
-                            p.tiles += 1;
-                            if target.tiles > 0 { target.tiles -= 1; }
-                            add_frontier_neighbors(p, tx, ty);
-                            if target.tiles == 0 {
-                                target.alive = false;
-                            }
-                        }
-                    }
-                } else {
-                    p.troops -= atk_str * 0.02;
-                }
-                ctx.db.players().id().update(target);
-            }
-        }
-        if p.troops < 10.0 { break; }
-    }
-    p.max_troops = compute_max_troops(p.tiles, p.city_levels);
-}
-
 // ── Tile helpers ─────────────────────────────────────────────────────────────
 
 fn is_land(ctx: &ReducerContext, match_id: u64, tx: u32, ty: u32) -> bool {
@@ -997,7 +1192,8 @@ fn is_land(ctx: &ReducerContext, match_id: u64, tx: u32, ty: u32) -> bool {
     match ctx.db.tile_chunks().id().find(chunk_id) {
         Some(chunk) => {
             let idx = (ly * CHUNK_SIZE + lx) as usize;
-            chunk.terrain.get(idx).copied().unwrap_or(0) == 1
+            // Any non-ocean terrain code counts as land (plains/highland/mountain).
+            chunk.terrain.get(idx).copied().unwrap_or(0) != 0
         }
         None => false,
     }
@@ -1032,23 +1228,199 @@ fn set_owner(ctx: &ReducerContext, match_id: u64, tx: u32, ty: u32, owner: u32) 
     }
 }
 
-// Find tiles owned by `target_id` that sit on the border with `attacker` —
-// i.e. target-owned tiles that have at least one attacker-owned 4-neighbour.
-// These are the tiles that an attack *can actually capture*, so the attack
-// loop's `set_owner(tx, ty, attacker.id)` call is a real flip (not a no-op
-// as it was when this function returned attacker-owned tiles).
-//
-// Iterates only the attacker's `owned_chunks` and their 8 neighbouring chunks
-// — a small set compared to the 946-chunk world scan the original did.
-fn find_border_tiles(cache: &mut ChunkCache, attacker: &Player, target_id: u32) -> Vec<(u32, u32)> {
-    let mut border: Vec<(u32, u32)> = Vec::new();
-    let mut seen = std::collections::HashSet::<u32>::new();
-    let attacker_byte = attacker.id as u8;
-    // Copy ids so we can freely call cache methods inside the loop.
-    let chunk_ids: Vec<u64> = attacker.owned_chunks.clone();
-    for chunk_id in chunk_ids {
-        // Clone the 1024-byte owners vec so we can iterate without holding a
-        // mutable reference into the cache (get_owner below needs &mut).
+// ── Attack tick: per-attack heap-based conquest ─────────────────────────────
+
+fn process_attack(
+    ctx: &ReducerContext,
+    cache: &mut ChunkCache,
+    match_id: u64,
+    current_tick: u64,
+    mut attack: Attack,
+) {
+    // Retreat: refund survivors (75% for player targets, 100% for wilderness)
+    // and delete the attack row.
+    if attack.retreating {
+        if let Some(mut attacker) = ctx.db.players().id().find(attack.attacker) {
+            let refund_mult = if attack.target == TARGET_WILDERNESS {
+                1.0
+            } else {
+                1.0 - RETREAT_MALUS
+            };
+            attacker.troops += attack.troops * refund_mult;
+            ctx.db.players().id().update(attacker);
+        }
+        ctx.db.attacks().id().delete(attack.id);
+        return;
+    }
+
+    let mut attacker = match ctx.db.players().id().find(attack.attacker) {
+        Some(p) if p.alive && p.spawn_tile.is_some() => p,
+        _ => { ctx.db.attacks().id().delete(attack.id); return; }
+    };
+    let mut target: Option<Player> = if attack.target == TARGET_WILDERNESS {
+        None
+    } else {
+        match ctx.db.players().id().find(attack.target) {
+            Some(p) if p.alive => Some(p),
+            _ => { ctx.db.attacks().id().delete(attack.id); return; }
+        }
+    };
+
+    // Reconstruct min-heap from the parallel Vecs persisted on the row.
+    let mut heap: BinaryHeap<Reverse<(i32, u32)>> = BinaryHeap::new();
+    for (i, &tile) in attack.to_conquer_tiles.iter().enumerate() {
+        let prio = attack.to_conquer_priorities.get(i).copied().unwrap_or(0);
+        heap.push(Reverse((prio, tile)));
+    }
+
+    let jitter = (rng_seed(match_id, current_tick, attack.id) % 5) as u32;
+    let mut tiles_per_tick = attack_tiles_per_tick(
+        attack.troops, target.as_ref(), attack.border.len() as u32 + jitter);
+
+    // Dirty-set to short-circuit border.contains() while we push neighbours.
+    let mut border_set: std::collections::HashSet<u32> =
+        attack.border.iter().copied().collect();
+
+    let mut deleted = false;
+    while tiles_per_tick > 0.0 {
+        if attack.troops < 1.0 {
+            ctx.db.attacks().id().delete(attack.id);
+            deleted = true;
+            break;
+        }
+        let entry = heap.pop();
+        let tile = match entry {
+            Some(Reverse((_prio, t))) => t,
+            None => {
+                // Heap drained — refresh from the full attacker border.
+                let (new_border, new_heap) = seed_attack_border(
+                    cache, &attacker, attack.target, attack.source_tile, current_tick);
+                if new_heap.is_empty() {
+                    // Nothing left to conquer — refund + delete (auto-retreat).
+                    let refund_mult = if attack.target == TARGET_WILDERNESS {
+                        1.0
+                    } else {
+                        1.0 - RETREAT_MALUS
+                    };
+                    attacker.troops += attack.troops * refund_mult;
+                    ctx.db.attacks().id().delete(attack.id);
+                    deleted = true;
+                    break;
+                }
+                border_set = new_border.iter().copied().collect();
+                attack.border = new_border;
+                for (t, p) in &new_heap {
+                    heap.push(Reverse((*p, *t)));
+                }
+                attack.last_refresh_tick = current_tick;
+                continue;
+            }
+        };
+        let tx = tile % SIM_W;
+        let ty = tile / SIM_W;
+
+        // Stale check: tile may have flipped since it was enqueued.
+        if !is_capturable(attack.target, cache.get_owner(tx, ty)) { continue; }
+        if !has_attacker_neighbor(cache, attacker.id, tx, ty) { continue; }
+
+        // Combat on this tile.
+        let terrain = cache.terrain_at(tx, ty);
+        let step = attack_logic(attack.troops, &attacker, target.as_ref(), terrain);
+        tiles_per_tick -= step.tiles_used;
+        attack.troops = (attack.troops - step.attacker_loss).max(0.0);
+        if let Some(ref mut t) = target {
+            t.troops = (t.troops - step.defender_loss).max(0.0);
+        }
+
+        // Guarded flip — only count the capture if prev_owner matched our target.
+        if let Some((chunk_id, prev_owner)) = cache.set_owner(tx, ty, attacker.id) {
+            if is_capturable(attack.target, prev_owner) {
+                player_add_chunk(&mut attacker, chunk_id);
+                attacker.tiles += 1;
+                if let Some(ref mut t) = target {
+                    if t.tiles > 0 { t.tiles -= 1; }
+                    if !cache.chunk_has_owner(chunk_id, t.id) {
+                        player_remove_chunk(t, chunk_id);
+                    }
+                    if t.tiles < DEFENDER_DEAD_TILES_THRESH && t.alive {
+                        t.alive = false;
+                    }
+                }
+                // Enqueue the captured tile's outward neighbours so the front
+                // keeps advancing.
+                let pushed = enqueue_tile_neighbors(
+                    cache, attacker.id, attack.target, tx, ty, current_tick);
+                for (ntile, nprio) in pushed {
+                    if border_set.insert(ntile) {
+                        if attack.border.len() < ATTACK_HEAP_CAP {
+                            attack.border.push(ntile);
+                        }
+                        heap.push(Reverse((nprio, ntile)));
+                    }
+                }
+            }
+        }
+
+        if attack.troops < 1.0 {
+            ctx.db.attacks().id().delete(attack.id);
+            deleted = true;
+            break;
+        }
+    }
+
+    if !deleted {
+        attack.to_conquer_tiles.clear();
+        attack.to_conquer_priorities.clear();
+        for Reverse((p, t)) in heap {
+            attack.to_conquer_tiles.push(t);
+            attack.to_conquer_priorities.push(p);
+            if attack.to_conquer_tiles.len() >= ATTACK_HEAP_CAP { break; }
+        }
+        ctx.db.attacks().id().update(attack);
+    }
+    ctx.db.players().id().update(attacker);
+    if let Some(t) = target {
+        ctx.db.players().id().update(t);
+    }
+}
+
+// ── Bot AI: periodic attack issuance (TribeExecution-lite) ──────────────────
+
+fn bot_ai_tick(ctx: &ReducerContext, cache: &mut ChunkCache, match_id: u64, current_tick: u64) {
+    let active_bots: Vec<_> = ctx.db.players().match_id().filter(match_id)
+        .filter(|p| p.is_bot && p.alive && p.spawn_tile.is_some())
+        .collect();
+    for bot in active_bots {
+        if bot.next_attack_tick > current_tick { continue; }
+        // Skip if we already have an active attack.
+        let busy = ctx.db.attacks().match_id().filter(match_id)
+            .any(|a| a.attacker == bot.id && !a.retreating);
+        if busy {
+            continue;
+        }
+
+        let pick = pick_bot_target(cache, &bot);
+        if let Some(target_id) = pick {
+            let _ = launch_attack_internal(ctx, cache, match_id, bot.id, target_id, current_tick);
+        }
+        // Schedule next attempt regardless of success.
+        let seed = rng_seed(match_id, current_tick, bot.id as u64);
+        let range = (BOT_ATTACK_COOLDOWN_MAX_TICKS - BOT_ATTACK_COOLDOWN_MIN_TICKS).max(1);
+        let offset = seed % range;
+        if let Some(mut bot) = ctx.db.players().id().find(bot.id) {
+            bot.next_attack_tick = current_tick + BOT_ATTACK_COOLDOWN_MIN_TICKS + offset;
+            ctx.db.players().id().update(bot);
+        }
+    }
+}
+
+fn pick_bot_target(cache: &mut ChunkCache, bot: &Player) -> Option<u32> {
+    let mut neighbours: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut has_wilderness = false;
+    let attacker_byte = bot.id as u8;
+    let chunk_ids: Vec<u64> = bot.owned_chunks.clone();
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+    'outer: for chunk_id in chunk_ids {
         let owners = match cache.clone_owners(chunk_id) {
             Some(o) => o,
             None => continue,
@@ -1063,25 +1435,29 @@ fn find_border_tiles(cache: &mut ChunkCache, attacker: &Player, target_id: u32) 
                 let tx = cx * CHUNK_SIZE + lx;
                 let ty = cy * CHUNK_SIZE + ly;
                 if tx >= SIM_W || ty >= SIM_H { continue; }
-                let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
                 for (dx, dy) in dirs {
                     let nx = tx as i32 + dx;
                     let ny = ty as i32 + dy;
                     if nx < 0 || nx >= SIM_W as i32 || ny < 0 || ny >= SIM_H as i32 { continue; }
                     let nxu = nx as u32;
                     let nyu = ny as u32;
-                    if cache.get_owner(nxu, nyu) == Some(target_id) {
-                        // Push the TARGET's tile — this is the one that gets flipped.
-                        let key = nyu * SIM_W + nxu;
-                        if seen.insert(key) {
-                            border.push((nxu, nyu));
-                        }
+                    if !cache.is_land(nxu, nyu) { continue; }
+                    match cache.get_owner(nxu, nyu) {
+                        None => has_wilderness = true,
+                        Some(o) if o != bot.id => { neighbours.insert(o); }
+                        _ => {}
                     }
                 }
+                if neighbours.len() >= 4 && has_wilderness { break 'outer; }
             }
         }
     }
-    border
+    let mut options: Vec<u32> = neighbours.into_iter().collect();
+    if has_wilderness { options.push(TARGET_WILDERNESS); }
+    if options.is_empty() { return None; }
+    let seed = rng_seed(bot.match_id, 0, bot.id as u64);
+    let idx = (seed as usize) % options.len();
+    Some(options[idx])
 }
 
 // ── Bot AI ───────────────────────────────────────────────────────────────────
@@ -1128,13 +1504,12 @@ fn bot_spawn_internal(ctx: &ReducerContext, match_id: u64, player_id: u32, tile:
     p.troops = START_TROOPS_BOT;
     p.gold = 0.0;
     p.tiles = 1;
-    p.max_troops = compute_max_troops(1, 0);
+    p.max_troops = compute_max_troops(1, 0, p.is_bot);
     set_owner(ctx, match_id, tx, ty, player_id);
-    // Track the spawn tile's chunk so find_border_tiles / passive_expand find it.
+    // Track the spawn tile's chunk so seed_attack_border finds the bot.
     if let Some(chunk_id) = spawn_chunk_id(match_id, tx, ty) {
         player_add_chunk(&mut p, chunk_id);
     }
-    seed_frontier(&mut p, tx, ty);
     ctx.db.players().id().update(p);
     Ok(())
 }
